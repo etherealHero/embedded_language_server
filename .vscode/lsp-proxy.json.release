@@ -1,8 +1,7 @@
 [
   {
     "languageId": "lsp_proxy",
-    "command": "cargo",
-    "args": ["run", "--"],
+    "command": "%CD%/target/debug/lsp_proxy.exe",
     "fileExtensions": [".txt"]
   }
 ]
