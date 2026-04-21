@@ -1,0 +1,7 @@
+[
+  {
+    "languageId": "lsp_proxy",
+    "command": "%CD%/target/debug/lsp_proxy.exe",
+    "fileExtensions": [".txt"]
+  }
+]
