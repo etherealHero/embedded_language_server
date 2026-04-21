@@ -28,6 +28,7 @@ async fn main() {
         });
         router
             .request::<request::Initialize, _>(|_, _| async move {
+                tracing::info!("{} v{}", clap::crate_name!(), clap::crate_version!());
                 Ok(InitializeResult {
                     capabilities: ServerCapabilities {
                         hover_provider: Some(HoverProviderCapability::Simple(true)),
@@ -48,14 +49,22 @@ async fn main() {
                     }))
                 }
             })
-            .request::<request::GotoDefinition, _>(|_, _| async move {
-                unimplemented!("Not yet implemented!")
-            })
             .notification::<notification::Initialized>(|_, _| ControlFlow::Continue(()))
             .notification::<notification::DidChangeConfiguration>(|_, _| ControlFlow::Continue(()))
             .notification::<notification::DidOpenTextDocument>(|_, _| ControlFlow::Continue(()))
             .notification::<notification::DidChangeTextDocument>(|_, _| ControlFlow::Continue(()))
-            .notification::<notification::DidCloseTextDocument>(|_, _| ControlFlow::Continue(()));
+            .notification::<notification::DidCloseTextDocument>(|_, _| ControlFlow::Continue(()))
+            .unhandled_notification(|_, notify| {
+                tracing::warn!("unhandled_notification `{}`", notify.method);
+                ControlFlow::Continue(())
+            })
+            .unhandled_request(|_, req| async move {
+                tracing::warn!("unhandled_request `{}`", req.method);
+                Err(async_lsp::ResponseError::new(
+                    async_lsp::ErrorCode::REQUEST_FAILED,
+                    format!("unhandled request `{}`", req.method),
+                ))
+            });
 
         ServiceBuilder::new()
             .layer(TracingLayer::default())

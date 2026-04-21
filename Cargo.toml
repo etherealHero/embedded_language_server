@@ -40,3 +40,8 @@ features = ["io-std", "io-util", "macros", "process", "rt", "time"]
 [dependencies.tokio-util]
 version = "0.7.8"
 features = ["compat"]
+
+
+[dependencies.clap]
+version = "4.6.1"
+features = ["cargo"]
