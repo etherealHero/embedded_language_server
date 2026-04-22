@@ -2,6 +2,10 @@
   {
     "languageId": "lsp_proxy",
     "command": "%CD%/target/debug/lsp_proxy.exe",
-    "fileExtensions": [".txt"]
+    "fileExtensions": [".txt"],
+    "initializationOptions": {
+      "host": "host",
+      "database": "database"
+    }
   }
 ]

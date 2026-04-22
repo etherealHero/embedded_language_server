@@ -3,6 +3,10 @@
     "languageId": "lsp_proxy",
     "command": "cargo",
     "args": ["run", "--"],
-    "fileExtensions": [".txt"]
+    "fileExtensions": [".txt"],
+    "initializationOptions": {
+      "host": "host",
+      "database": "database"
+    }
   }
 ]
