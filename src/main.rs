@@ -137,6 +137,43 @@ impl Server {
 
         toml::from_str(&raw_config).map_err(|e| E::new(EK::InvalidData, e))
     }
+
+    async fn startup(&self, p: &lsp::InitializeParams) -> std::io::Result<()> {
+        let config = self.get_config(p)?;
+        let new_pool = deadpool_tiberius::Manager::new()
+            .host(&config.host)
+            .database(&config.database)
+            .authentication(deadpool_tiberius::tiberius::AuthMethod::Integrated)
+            .trust_cert()
+            .wait_timeout(std::time::Duration::from_secs(5))
+            .create_pool()
+            .inspect_err(|e| error!("Create pool error: {e}"))
+            .map_err(std::io::Error::other)?;
+
+        {
+            let mut unit_pool = self.state.pool.lock().await;
+            *unit_pool = Some(new_pool);
+            info!("Create pool success: {}.{}", config.host, config.database)
+        } // lock free
+
+        let rows = self.query(&config.get_symbols_query).await;
+        let result = rows.inspect_err(|e| error!("Query error: {e}"));
+        let missing_column = "Column 'Identifier' must present in get_symbols_query";
+        for row in result.unwrap_or_default() {
+            let try_ident = row.try_get::<&str, &str>("Identifier");
+            let ident = try_ident.map_err(std::io::Error::other)?;
+            let ident = ident.ok_or_else(|| std::io::Error::other(missing_column))?;
+            let try_hover = row.try_get::<&str, &str>("HoverInfo");
+            let hover = try_hover.unwrap_or_default().map(String::from);
+            let symbol = SymbolInfo { hover };
+            self.state.symbols.insert(ident.into(), symbol);
+        }
+
+        let mut uninit_config = self.state.config.write().await;
+        *uninit_config = config;
+
+        Ok(())
+    }
 }
 
 /// [`lsp`] implementation
@@ -182,7 +219,17 @@ impl Server {
         info!("{} v{}", clap::crate_name!(), clap::crate_version!());
         debug!("initialization_options `{:#?}`", p.initialization_options);
 
-        let initialize_result = Ok(lsp::InitializeResult {
+        if let Err(e) = self.startup(&p).await {
+            error!("Startup error: {e}");
+            let message = "Startup error occured, see output for more details".to_string();
+            let typ = lsp::MessageType::WARNING;
+            let client_socket = self.state.client.get().cloned();
+            client_socket.map(|mut c| c.show_message(lsp::ShowMessageParams { typ, message }));
+        } else {
+            info!("Startup success");
+        };
+
+        Ok(lsp::InitializeResult {
             capabilities: lsp::ServerCapabilities {
                 text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
                     lsp::TextDocumentSyncKind::INCREMENTAL,
@@ -195,53 +242,7 @@ impl Server {
                 name: clap::crate_name!().to_string(),
                 version: Some(clap::crate_version!().to_string()),
             }),
-        });
-
-        let Ok(config) = self.get_config(&p).inspect_err(|e| {
-            error!("Get config error: {e}");
-            let message = "Get config error occured, see output for more details".to_string();
-            let typ = lsp::MessageType::WARNING;
-            let client_socket = self.state.client.get().cloned();
-            client_socket.map(|mut c| c.show_message(lsp::ShowMessageParams { typ, message }));
-        }) else {
-            return initialize_result;
-        };
-
-        let try_create_pool = deadpool_tiberius::Manager::new()
-            .host(&config.host)
-            .database(&config.database)
-            .authentication(deadpool_tiberius::tiberius::AuthMethod::Integrated)
-            .trust_cert()
-            .wait_timeout(std::time::Duration::from_secs(5))
-            .create_pool()
-            .inspect(|_| info!("Create pool success: {}.{}", config.host, config.database))
-            .inspect_err(|e| error!("Create pool error: {e}"));
-
-        if let Ok(new_pool) = try_create_pool {
-            let mut unit_pool = self.state.pool.lock().await;
-            *unit_pool = Some(new_pool);
-        } else {
-            return initialize_result;
-        } // lock free
-
-        let rows = self.query(&config.get_symbols_query).await;
-        let result = rows.inspect_err(|e| error!("Query error: {e}"));
-        for row in result.unwrap_or_default() {
-            let Ok(Some(ident)) = row.try_get::<&str, &str>("Identifier") else {
-                error!("Symbols query must contains 'Identifier' not nullable column");
-                break;
-            };
-            let try_get = row.try_get::<&str, &str>("HoverInfo");
-            let hover = try_get.unwrap_or_default().map(String::from);
-            let symbol = SymbolInfo { hover };
-            self.state.symbols.insert(ident.into(), symbol);
-        }
-
-        let mut uninit_config = self.state.config.write().await;
-        *uninit_config = config;
-
-        info!("Initialize success");
-        initialize_result
+        })
     }
 }
 
