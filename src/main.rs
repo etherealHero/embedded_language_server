@@ -29,6 +29,10 @@ struct ServerState {
     text_documents: dashmap::DashMap<std::path::PathBuf, ropey::Rope>,
 }
 
+struct Server {
+    state: Arc<ServerState>,
+}
+
 impl ServerState {
     fn set_text_document(
         &self,
@@ -76,105 +80,6 @@ impl ServerState {
             Ok(path)
         }
     }
-}
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    let (server, _) = async_lsp::MainLoop::new_server(|client| {
-        let mut router = async_lsp::router::Router::new(Arc::new(ServerState {
-            client: client.clone().into(),
-            ..ServerState::default()
-        }));
-
-        fn add_request<T: R::Request, Fut: Future<Output = Req<T>> + Send + 'static, H>(
-            router: &mut async_lsp::router::Router<Arc<ServerState>, async_lsp::ResponseError>,
-            handler: H,
-        ) -> &mut async_lsp::router::Router<Arc<ServerState>, async_lsp::ResponseError>
-        where
-            H: Fn(Server, T::Params) -> Fut + Send + Sync + 'static,
-        {
-            router.request::<T, _>(move |st: &mut Arc<ServerState>, p| {
-                let state = Arc::clone(st);
-                handler(Server { state }, p)
-            })
-        }
-
-        add_request::<R::HoverRequest, _, _>(&mut router, Server::hover);
-        add_request::<R::Initialize, _, _>(&mut router, Server::initialize);
-
-        router
-            .notification::<N::Initialized>(|_, _| F::Continue(()))
-            .notification::<N::DidChangeConfiguration>(|_, _| F::Continue(()))
-            .notification::<N::DidOpenTextDocument>(|st, p| {
-                let event = lsp::TextDocumentContentChangeEvent {
-                    text: p.text_document.text,
-                    range_length: None,
-                    range: None,
-                };
-                st.set_text_document(p.text_document.uri, &[event])
-                    .inspect_err(|e| error!("Did open text document error: {e}"))
-                    .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
-            })
-            .notification::<N::DidChangeTextDocument>(|st, p| {
-                st.set_text_document(p.text_document.uri, &p.content_changes)
-                    .inspect_err(|e| error!("did change text document error: {e}"))
-                    .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
-            })
-            .notification::<N::DidCloseTextDocument>(|st, p| {
-                st.remove_text_document(p.text_document.uri)
-                    .inspect_err(|e| error!("did close text document error: {e}"))
-                    .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
-            })
-            .unhandled_notification(|_, notify| {
-                warn!("unhandled_notification `{}`", notify.method);
-                F::Continue(())
-            })
-            .unhandled_request(|_, req| async move {
-                warn!("unhandled_request `{}`", req.method);
-                Err(async_lsp::ResponseError::new(
-                    async_lsp::ErrorCode::REQUEST_FAILED,
-                    format!("unhandled request `{}`", req.method),
-                ))
-            });
-
-        tower::ServiceBuilder::new()
-            .layer(async_lsp::tracing::TracingLayer::default())
-            .layer(async_lsp::server::LifecycleLayer::default())
-            .layer(async_lsp::panic::CatchUnwindLayer::default())
-            .layer(async_lsp::concurrency::ConcurrencyLayer::default())
-            .layer(async_lsp::client_monitor::ClientProcessMonitorLayer::new(
-                client,
-            ))
-            .service(router)
-    });
-
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(std::io::stderr)
-        .with_line_number(cfg!(debug_assertions))
-        .with_file(cfg!(debug_assertions))
-        .with_max_level(cfg_select! {
-            debug_assertions => tracing::Level::DEBUG,
-            _ => tracing::Level::INFO
-        })
-        .init();
-
-    let (stdin, stdout) = cfg_select! {
-        unix => (
-            async_lsp::stdio::PipeStdin::lock_tokio().unwrap(),
-            async_lsp::stdio::PipeStdout::lock_tokio().unwrap(),
-        ),
-        _ => (
-            tokio_util::compat::TokioAsyncReadCompatExt::compat(tokio::io::stdin()),
-            tokio_util::compat::TokioAsyncWriteCompatExt::compat_write(tokio::io::stdout()),
-        )
-    };
-
-    server.run_buffered(stdin, stdout).await.unwrap();
-}
-
-struct Server {
-    state: Arc<ServerState>,
 }
 
 impl Server {
@@ -338,4 +243,99 @@ impl Server {
         info!("Initialize success");
         initialize_result
     }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let (server, _) = async_lsp::MainLoop::new_server(|client| {
+        let mut router = async_lsp::router::Router::new(Arc::new(ServerState {
+            client: client.clone().into(),
+            ..ServerState::default()
+        }));
+
+        fn add_request<T: R::Request, Fut: Future<Output = Req<T>> + Send + 'static, H>(
+            router: &mut async_lsp::router::Router<Arc<ServerState>, async_lsp::ResponseError>,
+            handler: H,
+        ) -> &mut async_lsp::router::Router<Arc<ServerState>, async_lsp::ResponseError>
+        where
+            H: Fn(Server, T::Params) -> Fut + Send + Sync + 'static,
+        {
+            router.request::<T, _>(move |st: &mut Arc<ServerState>, p| {
+                let state = Arc::clone(st);
+                handler(Server { state }, p)
+            })
+        }
+
+        add_request::<R::HoverRequest, _, _>(&mut router, Server::hover);
+        add_request::<R::Initialize, _, _>(&mut router, Server::initialize);
+
+        router
+            .notification::<N::Initialized>(|_, _| F::Continue(()))
+            .notification::<N::DidChangeConfiguration>(|_, _| F::Continue(()))
+            .notification::<N::DidOpenTextDocument>(|st, p| {
+                let event = lsp::TextDocumentContentChangeEvent {
+                    text: p.text_document.text,
+                    range_length: None,
+                    range: None,
+                };
+                st.set_text_document(p.text_document.uri, &[event])
+                    .inspect_err(|e| error!("Did open text document error: {e}"))
+                    .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
+            })
+            .notification::<N::DidChangeTextDocument>(|st, p| {
+                st.set_text_document(p.text_document.uri, &p.content_changes)
+                    .inspect_err(|e| error!("did change text document error: {e}"))
+                    .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
+            })
+            .notification::<N::DidCloseTextDocument>(|st, p| {
+                st.remove_text_document(p.text_document.uri)
+                    .inspect_err(|e| error!("did close text document error: {e}"))
+                    .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
+            })
+            .unhandled_notification(|_, notify| {
+                warn!("unhandled_notification `{}`", notify.method);
+                F::Continue(())
+            })
+            .unhandled_request(|_, req| async move {
+                warn!("unhandled_request `{}`", req.method);
+                Err(async_lsp::ResponseError::new(
+                    async_lsp::ErrorCode::REQUEST_FAILED,
+                    format!("unhandled request `{}`", req.method),
+                ))
+            });
+
+        tower::ServiceBuilder::new()
+            .layer(async_lsp::tracing::TracingLayer::default())
+            .layer(async_lsp::server::LifecycleLayer::default())
+            .layer(async_lsp::panic::CatchUnwindLayer::default())
+            .layer(async_lsp::concurrency::ConcurrencyLayer::default())
+            .layer(async_lsp::client_monitor::ClientProcessMonitorLayer::new(
+                client,
+            ))
+            .service(router)
+    });
+
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .with_line_number(cfg!(debug_assertions))
+        .with_file(cfg!(debug_assertions))
+        .with_max_level(cfg_select! {
+            debug_assertions => tracing::Level::DEBUG,
+            _ => tracing::Level::INFO
+        })
+        .init();
+
+    let (stdin, stdout) = cfg_select! {
+        unix => (
+            async_lsp::stdio::PipeStdin::lock_tokio().unwrap(),
+            async_lsp::stdio::PipeStdout::lock_tokio().unwrap(),
+        ),
+        _ => (
+            tokio_util::compat::TokioAsyncReadCompatExt::compat(tokio::io::stdin()),
+            tokio_util::compat::TokioAsyncWriteCompatExt::compat_write(tokio::io::stdout()),
+        )
+    };
+
+    server.run_buffered(stdin, stdout).await.unwrap();
 }
