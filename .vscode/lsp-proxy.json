@@ -5,8 +5,7 @@
     "args": ["run", "--"],
     "fileExtensions": [".txt"],
     "initializationOptions": {
-      "host": "host",
-      "database": "database"
+      "configPath": ".vscode/lsp_proxy_config.toml"
     }
   }
 ]

@@ -1,84 +1,108 @@
+use async_lsp::LanguageClient;
 use async_lsp::lsp_types::{self as lsp, notification as N, request as R};
-use std::ops::ControlFlow as F;
+use std::{ops::ControlFlow as F, sync::Arc};
 use tracing::{debug, error, info, warn};
 
-type Req<T> = futures::future::BoxFuture<
-    'static,
-    Result<<T as R::Request>::Result, async_lsp::ResponseError>,
->;
-
+type Req<T> = Result<<T as R::Request>::Result, async_lsp::ResponseError>;
 type Notify = F<Result<(), async_lsp::Error>>;
+type Pool = Arc<tokio::sync::Mutex<Option<deadpool_tiberius::Pool>>>;
 
-type Pool = std::sync::Arc<tokio::sync::Mutex<Option<deadpool_tiberius::Pool>>>;
+#[derive(serde::Deserialize, Debug, Default)]
+struct Config {
+    host: String,
+    database: String,
+    get_symbols_query: String,
+}
+
+#[derive(Debug)]
+struct SymbolInfo {
+    hover: Option<String>,
+}
 
 #[derive(Default)]
 struct ServerState {
     pool: Pool,
-    text_documents: dashmap::DashMap<std::path::PathBuf, ropey::Rope>,
+    config: tokio::sync::RwLock<Config>,
+    client: std::sync::OnceLock<async_lsp::ClientSocket>,
+    symbols: dashmap::DashMap<String, SymbolInfo>,
     url_to_path: dashmap::DashMap<lsp::Url, std::path::PathBuf>,
-    _client: Option<async_lsp::ClientSocket>,
+    text_documents: dashmap::DashMap<std::path::PathBuf, ropey::Rope>,
 }
 
-fn set_text_document(
-    st: &mut ServerState,
-    url: lsp::Url,
-    changes: &[lsp::TextDocumentContentChangeEvent],
-) -> std::io::Result<()> {
-    let path = url_to_path(st, url)?;
-    if changes.len() == 1 && changes[0].range.is_none() {
-        let text_document = ropey::Rope::from_str(changes[0].text.as_str());
-        st.text_documents.insert(path, text_document);
-    } else {
-        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
-        let mut text_document = st.text_documents.get_mut(&path).ok_or(err)?;
-        for change in changes {
-            let td = &mut text_document;
-            let r = change.range.as_ref().unwrap();
-            let text = change.text.as_str();
-            let start = td.line_to_char(r.start.line as usize) + r.start.character as usize;
-            let end = td.line_to_char(r.end.line as usize) + r.end.character as usize;
-            td.remove(start..end);
-            td.insert(start, text);
+impl ServerState {
+    fn set_text_document(
+        &self,
+        url: lsp::Url,
+        changes: &[lsp::TextDocumentContentChangeEvent],
+    ) -> std::io::Result<()> {
+        let path = self.url_to_path(url)?;
+        if changes.len() == 1 && changes[0].range.is_none() {
+            let text_document = ropey::Rope::from_str(changes[0].text.as_str());
+            self.text_documents.insert(path, text_document);
+        } else {
+            let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+            let td = &mut self.text_documents.get_mut(&path).ok_or(err)?;
+            for change in changes {
+                let r = change.range.as_ref().unwrap();
+                let start = td.line_to_char(r.start.line as usize) + r.start.character as usize;
+                let end = td.line_to_char(r.end.line as usize) + r.end.character as usize;
+                td.remove(start..end);
+                td.insert(start, &change.text);
+            }
         }
+        Ok(())
     }
-    Ok(())
-}
 
-fn get_text_document(st: &ServerState, url: lsp::Url) -> std::io::Result<ropey::Rope> {
-    st.text_documents
-        .get(&url_to_path(st, url)?)
-        .map(|text_document| text_document.clone())
-        .ok_or(std::io::Error::from(std::io::ErrorKind::NotFound))
-}
+    fn get_text_document(&self, url: lsp::Url) -> std::io::Result<ropey::Rope> {
+        self.text_documents
+            .get(&self.url_to_path(url)?)
+            .map(|text_document| text_document.clone())
+            .ok_or(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }
 
-fn remove_text_document(st: &ServerState, url: lsp::Url) -> std::io::Result<()> {
-    st.text_documents.remove(&url_to_path(st, url)?);
-    Ok(())
-}
+    fn remove_text_document(&self, url: lsp::Url) -> std::io::Result<()> {
+        self.text_documents.remove(&self.url_to_path(url)?);
+        Ok(())
+    }
 
-fn url_to_path(st: &ServerState, url: lsp::Url) -> std::io::Result<std::path::PathBuf> {
-    if let Some(p) = st.url_to_path.get(&url) {
-        Ok(p.clone())
-    } else {
-        let path = url.to_file_path();
-        let path = path.map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-        let path = dunce::canonicalize(dunce::simplified(&path))?;
-        st.url_to_path.insert(url, path.clone());
-        Ok(path)
+    fn url_to_path(&self, url: lsp::Url) -> std::io::Result<std::path::PathBuf> {
+        if let Some(p) = self.url_to_path.get(&url) {
+            Ok(p.clone())
+        } else {
+            let path = url.to_file_path();
+            let path = path.map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+            let path = dunce::canonicalize(dunce::simplified(&path))?;
+            self.url_to_path.insert(url, path.clone());
+            Ok(path)
+        }
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let (server, _) = async_lsp::MainLoop::new_server(|client| {
-        let mut router = async_lsp::router::Router::new(ServerState {
-            pool: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            _client: client.clone().into(),
+        let mut router = async_lsp::router::Router::new(Arc::new(ServerState {
+            client: client.clone().into(),
             ..ServerState::default()
-        });
+        }));
+
+        fn add_request<T: R::Request, Fut: Future<Output = Req<T>> + Send + 'static, H>(
+            router: &mut async_lsp::router::Router<Arc<ServerState>, async_lsp::ResponseError>,
+            handler: H,
+        ) -> &mut async_lsp::router::Router<Arc<ServerState>, async_lsp::ResponseError>
+        where
+            H: Fn(Server, T::Params) -> Fut + Send + Sync + 'static,
+        {
+            router.request::<T, _>(move |st: &mut Arc<ServerState>, p| {
+                let state = Arc::clone(st);
+                handler(Server { state }, p)
+            })
+        }
+
+        add_request::<R::HoverRequest, _, _>(&mut router, Server::hover);
+        add_request::<R::Initialize, _, _>(&mut router, Server::initialize);
+
         router
-            .request::<R::Initialize, _>(initialize)
-            .request::<R::HoverRequest, _>(hover)
             .notification::<N::Initialized>(|_, _| F::Continue(()))
             .notification::<N::DidChangeConfiguration>(|_, _| F::Continue(()))
             .notification::<N::DidOpenTextDocument>(open)
@@ -130,39 +154,81 @@ async fn main() {
     server.run_buffered(stdin, stdout).await.unwrap();
 }
 
-async fn query(pool: Pool) -> deadpool_tiberius::SqlServerResult<String> {
-    let get_pool = pool.lock().await;
-    let Some(pool) = get_pool.as_ref() else {
-        return Err(deadpool_tiberius::SqlServerError::PoolBuild(
-            deadpool_tiberius::deadpool::managed::BuildError::NoRuntimeSpecified,
-        ));
-    };
-    let mut conn = pool.get().await?;
-    let res = conn
-        .simple_query("select 'lorem ipsum' as field0")
-        .await?
-        .into_row()
-        .await?
-        .unwrap();
-    let res: Option<&str> = res.get("field0");
-    Ok(res.unwrap().to_string())
+struct Server {
+    state: Arc<ServerState>,
 }
 
-fn close(st: &mut ServerState, p: lsp::DidCloseTextDocumentParams) -> Notify {
-    remove_text_document(st, p.text_document.uri)
+impl Server {
+    async fn query(
+        &self,
+        query: &str, // TODO: add timeout (with config option)
+    ) -> deadpool_tiberius::SqlServerResult<Vec<deadpool_tiberius::tiberius::Row>> {
+        use deadpool_tiberius::{SqlServerError as SSE, deadpool::managed::BuildError as BE};
+        let lock_fail = |e| SSE::Io(std::io::Error::new(std::io::ErrorKind::ResourceBusy, e));
+        let try_lock = self.state.pool.try_lock();
+        let pool = try_lock.map_err(lock_fail)?.as_ref().cloned();
+        let pool = pool.ok_or(SSE::PoolBuild(BE::NoRuntimeSpecified))?;
+        let mut conn = pool.get().await?;
+        Ok(conn.simple_query(query).await?.into_first_result().await?)
+    }
+
+    fn get_config(&self, p: &lsp::InitializeParams) -> std::io::Result<Config> {
+        use std::io::{Error as E, ErrorKind as EK};
+
+        let undefined_config_path_opt = "Initialization options must contains 'configPath' option"; // TODO:
+        let options = p.initialization_options.as_ref();
+        let config_path = options.and_then(|v| v["configPath"].as_str().map(String::from));
+        let config_path = &config_path.ok_or(E::new(EK::NotFound, undefined_config_path_opt))?;
+        let msg = concat!(
+            "Resolve workspace folder fail. ",
+            "Language Client does not provide any workspace folder options ",
+            "(workspace_folders, root_path, root_uri). ",
+            "You should open your text editor in some project. ",
+            "If it's not helped, your editor does not support this feature ",
+            "(https://microsoft.github.io/language-server-protocol/",
+            "specifications/lsp/3.17/specification/#workspace_workspaceFolders)."
+        );
+
+        #[allow(deprecated)]
+        let root = p
+            .workspace_folders
+            .as_ref()
+            .and_then(|wf| wf.first().cloned())
+            .and_then(|f| f.uri.to_file_path().ok())
+            .or_else(|| p.root_path.as_ref().map(std::path::PathBuf::from))
+            .or_else(|| p.root_uri.as_ref().and_then(|url| url.to_file_path().ok()))
+            .inspect(|p| info!("Resolved Workspace: {}", p.display()))
+            .ok_or(E::new(EK::NotFound, msg))?;
+
+        info!("Resolved config path: {}", root.join(config_path).display());
+
+        let path = root.join(config_path);
+        let try_exists = path.try_exists()?;
+        let try_exists = try_exists.eq(&true).then_some(1);
+
+        try_exists.ok_or(E::new(EK::NotFound, "Config file not exists"))?;
+        info!("Found config: {}", path.display());
+
+        let raw_config = std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned())?;
+
+        toml::from_str(&raw_config).map_err(|e| E::new(EK::InvalidData, e))
+    }
+}
+
+fn close(st: &mut Arc<ServerState>, p: lsp::DidCloseTextDocumentParams) -> Notify {
+    st.remove_text_document(p.text_document.uri)
         .inspect_err(|e| error!("did close text document error: {e}"))
         .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
 }
 
-fn change(st: &mut ServerState, p: lsp::DidChangeTextDocumentParams) -> Notify {
-    set_text_document(st, p.text_document.uri, &p.content_changes)
+fn change(st: &mut Arc<ServerState>, p: lsp::DidChangeTextDocumentParams) -> Notify {
+    st.set_text_document(p.text_document.uri, &p.content_changes)
         .inspect_err(|e| error!("did change text document error: {e}"))
         .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
 }
 
-fn open(st: &mut ServerState, p: lsp::DidOpenTextDocumentParams) -> Notify {
-    set_text_document(
-        st,
+fn open(st: &mut Arc<ServerState>, p: lsp::DidOpenTextDocumentParams) -> Notify {
+    st.set_text_document(
         p.text_document.uri,
         &[lsp::TextDocumentContentChangeEvent {
             text: p.text_document.text,
@@ -170,89 +236,112 @@ fn open(st: &mut ServerState, p: lsp::DidOpenTextDocumentParams) -> Notify {
             range: None,
         }],
     )
-    .inspect_err(|e| error!("did open text document error: {e}"))
+    .inspect_err(|e| error!("Did open text document error: {e}"))
     .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
 }
 
-fn hover(st: &mut ServerState, p: lsp::HoverParams) -> Req<R::HoverRequest> {
-    use async_lsp::{ErrorCode as E, ResponseError as R};
+/// [`lsp`] implementation
+impl Server {
+    async fn hover(self, p: lsp::HoverParams) -> Req<R::HoverRequest> {
+        use async_lsp::{ErrorCode as E, ResponseError as R};
 
-    let fail = |e| Box::pin(async move { Err(R::new(E::REQUEST_FAILED, e)) });
-    let pool = st.pool.clone();
-    let url = p.text_document_position_params.text_document.uri;
-    let text_document = match get_text_document(st, url) {
-        Ok(text_document) => text_document,
-        Err(e) => return fail(e),
-    };
-    let line_idx = p.text_document_position_params.position.line as usize;
-    let Some(line) = text_document.get_line(line_idx) else {
-        return fail(std::io::Error::from(std::io::ErrorKind::InvalidData));
-    };
-    let line = line.to_string();
+        let fail = |e| R::new(E::REQUEST_FAILED, e);
+        let url = p.text_document_position_params.text_document.uri;
+        let position = p.text_document_position_params.position;
+        let text_document = self.state.get_text_document(url).map_err(fail)?;
+        let (line_idx, offset) = (position.line as usize, position.character as usize);
+        let line = text_document.get_line(line_idx).map(String::from);
+        let line = line.ok_or(fail(std::io::Error::from(std::io::ErrorKind::InvalidData)))?;
 
-    Box::pin(async move {
-        let res = query(pool)
-            .await
-            .inspect_err(|e| error!("query error: {e}"))
-            .ok()
-            .unwrap_or_default();
+        let ident = if offset > line.len() {
+            None
+        } else {
+            let re = regex::Regex::new(r"[\p{L}\p{N}_$]+").unwrap();
+            re.find_iter(&line).find_map(|m| {
+                let whole_ident = m.range().contains(&offset);
+                let last_char_ident = m.range().contains(&offset.saturating_sub(1));
+                (whole_ident | last_char_ident).then_some(m.as_str().to_string())
+            })
+        };
 
-        Ok(Some(lsp::Hover {
-            contents: lsp::HoverContents::Scalar(lsp::MarkedString::String(format!(
-                "I am a hover text! Query `{res}`, current server state text document line: `\n\n{line}\n\n`"
-            ))),
-            range: None,
-        }))
-    })
-}
+        let hover = ident
+            .as_ref()
+            .and_then(|identifier| self.state.symbols.get(identifier))
+            .and_then(|symbol| symbol.hover.clone())
+            .map(|value| lsp::Hover {
+                contents: lsp::HoverContents::Markup(lsp::MarkupContent {
+                    kind: lsp::MarkupKind::Markdown,
+                    value,
+                }),
+                range: None,
+            });
 
-fn initialize(st: &mut ServerState, p: lsp::InitializeParams) -> Req<R::Initialize> {
-    info!("{} v{}", clap::crate_name!(), clap::crate_version!());
+        Ok(hover)
+    }
 
-    let opt = p.initialization_options;
-    let get = |key| opt.as_ref().and_then(|v| v[key].as_str().map(String::from));
+    async fn initialize(self, p: lsp::InitializeParams) -> Req<R::Initialize> {
+        info!("{} v{}", clap::crate_name!(), clap::crate_version!());
+        debug!("initialization_options `{:#?}`", p.initialization_options);
 
-    debug!("initialization_options `{:#?}`", opt);
+        let initialize_result = Ok(lsp::InitializeResult {
+            capabilities: lsp::ServerCapabilities {
+                text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
+                    lsp::TextDocumentSyncKind::INCREMENTAL,
+                )),
+                hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+                definition_provider: Some(lsp::OneOf::Left(true)),
+                ..lsp::ServerCapabilities::default()
+            },
+            server_info: Some(async_lsp::lsp_types::ServerInfo {
+                name: clap::crate_name!().to_string(),
+                version: Some(clap::crate_version!().to_string()),
+            }),
+        });
 
-    let create_pool = match (get("host"), get("database")) {
-        (Some(ref h), Some(ref d)) => deadpool_tiberius::Manager::new()
-            .host(h)
-            .database(d)
+        let Ok(config) = self.get_config(&p).inspect_err(|e| {
+            error!("Get config error: {e}");
+            let message = "Get config error occured, see output for more details".to_string();
+            let typ = lsp::MessageType::WARNING;
+            let client_socket = self.state.client.get().cloned();
+            client_socket.map(|mut c| c.show_message(lsp::ShowMessageParams { typ, message }));
+        }) else {
+            return initialize_result;
+        };
+
+        let try_create_pool = deadpool_tiberius::Manager::new()
+            .host(&config.host)
+            .database(&config.database)
             .authentication(deadpool_tiberius::tiberius::AuthMethod::Integrated)
             .trust_cert()
             .wait_timeout(std::time::Duration::from_secs(5))
             .create_pool()
-            .inspect(|_| info!(r#"Create pool success with host("{h}") and database("{d}")"#))
-            .inspect_err(|e| error!("Create pool error: {e}"))
-            .ok()
-            .map(|new_pool| (new_pool, st.pool.clone())),
-        _ => {
-            warn!("Initialization options expect host(String) and database(String) options");
-            None
-        }
-    };
+            .inspect(|_| info!("Create pool success: {}.{}", config.host, config.database))
+            .inspect_err(|e| error!("Create pool error: {e}"));
 
-    let initialize_result = Ok(lsp::InitializeResult {
-        capabilities: lsp::ServerCapabilities {
-            text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
-                lsp::TextDocumentSyncKind::INCREMENTAL,
-            )),
-            hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
-            definition_provider: Some(lsp::OneOf::Left(true)),
-            ..lsp::ServerCapabilities::default()
-        },
-        server_info: Some(async_lsp::lsp_types::ServerInfo {
-            name: clap::crate_name!().to_string(),
-            version: Some(clap::crate_version!().to_string()),
-        }),
-    });
+        if let Ok(new_pool) = try_create_pool {
+            let mut unit_pool = self.state.pool.lock().await;
+            *unit_pool = Some(new_pool);
+        } else {
+            return initialize_result;
+        } // lock free
 
-    Box::pin(async move {
-        if let Some((new_pool, pool)) = create_pool {
-            let mut pool = pool.lock().await;
-            *pool = Some(new_pool);
+        let rows = self.query(&config.get_symbols_query).await;
+        let result = rows.inspect_err(|e| error!("Query error: {e}"));
+        for row in result.unwrap_or_default() {
+            let Ok(Some(ident)) = row.try_get::<&str, &str>("Identifier") else {
+                error!("Symbols query must contains 'Identifier' not nullable column");
+                break;
+            };
+            let try_get = row.try_get::<&str, &str>("HoverInfo");
+            let hover = try_get.unwrap_or_default().map(String::from);
+            let symbol = SymbolInfo { hover };
+            self.state.symbols.insert(ident.into(), symbol);
         }
 
+        let mut uninit_config = self.state.config.write().await;
+        *uninit_config = config;
+
+        info!("Initialize success");
         initialize_result
-    })
+    }
 }
