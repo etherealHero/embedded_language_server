@@ -4,8 +4,8 @@ use std::{ops::ControlFlow as F, sync::Arc};
 use tracing::{debug, error, info, warn};
 
 type Req<T> = Result<<T as R::Request>::Result, async_lsp::ResponseError>;
-type Notify = F<Result<(), async_lsp::Error>>;
 type Pool = Arc<tokio::sync::Mutex<Option<deadpool_tiberius::Pool>>>;
+type _Notify = F<Result<(), async_lsp::Error>>;
 
 #[derive(serde::Deserialize, Debug, Default)]
 struct Config {
@@ -105,9 +105,26 @@ async fn main() {
         router
             .notification::<N::Initialized>(|_, _| F::Continue(()))
             .notification::<N::DidChangeConfiguration>(|_, _| F::Continue(()))
-            .notification::<N::DidOpenTextDocument>(open)
-            .notification::<N::DidChangeTextDocument>(change)
-            .notification::<N::DidCloseTextDocument>(close)
+            .notification::<N::DidOpenTextDocument>(|st, p| {
+                let event = lsp::TextDocumentContentChangeEvent {
+                    text: p.text_document.text,
+                    range_length: None,
+                    range: None,
+                };
+                st.set_text_document(p.text_document.uri, &[event])
+                    .inspect_err(|e| error!("Did open text document error: {e}"))
+                    .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
+            })
+            .notification::<N::DidChangeTextDocument>(|st, p| {
+                st.set_text_document(p.text_document.uri, &p.content_changes)
+                    .inspect_err(|e| error!("did change text document error: {e}"))
+                    .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
+            })
+            .notification::<N::DidCloseTextDocument>(|st, p| {
+                st.remove_text_document(p.text_document.uri)
+                    .inspect_err(|e| error!("did close text document error: {e}"))
+                    .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
+            })
             .unhandled_notification(|_, notify| {
                 warn!("unhandled_notification `{}`", notify.method);
                 F::Continue(())
@@ -134,6 +151,8 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(std::io::stderr)
+        .with_line_number(cfg!(debug_assertions))
+        .with_file(cfg!(debug_assertions))
         .with_max_level(cfg_select! {
             debug_assertions => tracing::Level::DEBUG,
             _ => tracing::Level::INFO
@@ -213,31 +232,6 @@ impl Server {
 
         toml::from_str(&raw_config).map_err(|e| E::new(EK::InvalidData, e))
     }
-}
-
-fn close(st: &mut Arc<ServerState>, p: lsp::DidCloseTextDocumentParams) -> Notify {
-    st.remove_text_document(p.text_document.uri)
-        .inspect_err(|e| error!("did close text document error: {e}"))
-        .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
-}
-
-fn change(st: &mut Arc<ServerState>, p: lsp::DidChangeTextDocumentParams) -> Notify {
-    st.set_text_document(p.text_document.uri, &p.content_changes)
-        .inspect_err(|e| error!("did change text document error: {e}"))
-        .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
-}
-
-fn open(st: &mut Arc<ServerState>, p: lsp::DidOpenTextDocumentParams) -> Notify {
-    st.set_text_document(
-        p.text_document.uri,
-        &[lsp::TextDocumentContentChangeEvent {
-            text: p.text_document.text,
-            range_length: None,
-            range: None,
-        }],
-    )
-    .inspect_err(|e| error!("Did open text document error: {e}"))
-    .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
 }
 
 /// [`lsp`] implementation
