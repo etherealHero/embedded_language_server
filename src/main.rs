@@ -7,7 +7,7 @@ type Req<T> = Result<<T as R::Request>::Result, async_lsp::ResponseError>;
 type Pool = Arc<tokio::sync::Mutex<Option<deadpool_tiberius::Pool>>>;
 type _Notify = F<Result<(), async_lsp::Error>>;
 
-#[derive(serde::Deserialize, Debug, Default)]
+#[derive(serde::Deserialize, Debug, Default, Clone)]
 struct Config {
     host: String,
     database: String,
@@ -17,12 +17,14 @@ struct Config {
 #[derive(Debug)]
 struct SymbolInfo {
     hover: Option<String>,
+    definition: Option<String>,
+    definition_file_ext: Option<String>,
 }
 
 #[derive(Default)]
 struct ServerState {
     pool: Pool,
-    config: tokio::sync::RwLock<Config>,
+    config: tokio::sync::RwLock<(std::path::PathBuf, Config)>,
     client: std::sync::OnceLock<async_lsp::ClientSocket>,
     symbols: dashmap::DashMap<String, SymbolInfo>,
     url_to_path: dashmap::DashMap<lsp::Url, std::path::PathBuf>,
@@ -96,7 +98,10 @@ impl Server {
         Ok(conn.simple_query(query).await?.into_first_result().await?)
     }
 
-    fn get_config(&self, p: &lsp::InitializeParams) -> std::io::Result<Config> {
+    fn get_config(
+        &self,
+        p: &lsp::InitializeParams,
+    ) -> std::io::Result<(std::path::PathBuf, Config)> {
         use std::io::{Error as E, ErrorKind as EK};
 
         let undefined_config_path_opt = "Initialization options must contains 'configPath' option"; // TODO:
@@ -133,13 +138,14 @@ impl Server {
         try_exists.ok_or(E::new(EK::NotFound, "Config file not exists"))?;
         info!("Found config: {}", path.display());
 
-        let raw_config = std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned())?;
+        let raw_config = std::fs::read(&path).map(|b| String::from_utf8_lossy(&b).into_owned())?;
+        let config = toml::from_str(&raw_config).map_err(|e| E::new(EK::InvalidData, e))?;
 
-        toml::from_str(&raw_config).map_err(|e| E::new(EK::InvalidData, e))
+        Ok((path, config))
     }
 
     async fn startup(&self, p: &lsp::InitializeParams) -> std::io::Result<()> {
-        let config = self.get_config(p)?;
+        let (config_path, config) = self.get_config(p)?;
         let new_pool = deadpool_tiberius::Manager::new()
             .host(&config.host)
             .database(&config.database)
@@ -159,25 +165,105 @@ impl Server {
         let rows = self.query(&config.get_symbols_query).await;
         let result = rows.inspect_err(|e| error!("Query error: {e}"));
         let missing_column = "Column 'Identifier' must present in get_symbols_query";
+        let get_prop = |row: &deadpool_tiberius::tiberius::Row, prop: &str| {
+            let try_get_prop = row.try_get::<&str, &str>(prop);
+            try_get_prop.unwrap_or_default().map(String::from)
+        };
+
         for row in result.unwrap_or_default() {
             let try_ident = row.try_get::<&str, &str>("Identifier");
             let ident = try_ident.map_err(std::io::Error::other)?;
             let ident = ident.ok_or_else(|| std::io::Error::other(missing_column))?;
-            let try_hover = row.try_get::<&str, &str>("HoverInfo");
-            let hover = try_hover.unwrap_or_default().map(String::from);
-            let symbol = SymbolInfo { hover };
+            let symbol = SymbolInfo {
+                hover: get_prop(&row, "HoverInfo"),
+                definition: get_prop(&row, "DefinitionInfo"),
+                definition_file_ext: get_prop(&row, "DefinitionFileExtension"),
+            };
             self.state.symbols.insert(ident.into(), symbol);
         }
 
         let mut uninit_config = self.state.config.write().await;
-        *uninit_config = config;
+        *uninit_config = (config_path, config);
 
         Ok(())
+    }
+
+    fn get_ident(
+        &self,
+        url: lsp::Url,
+        position: lsp::Position,
+    ) -> Result<Option<String>, async_lsp::ResponseError> {
+        use async_lsp::{ErrorCode as E, ResponseError as R};
+        let fail = |e| R::new(E::REQUEST_FAILED, e);
+        let text_document = self.state.get_text_document(url).map_err(fail)?;
+        let (line_idx, offset) = (position.line as usize, position.character as usize);
+        let line = text_document.get_line(line_idx).map(String::from);
+        let line = line.ok_or(fail(std::io::Error::from(std::io::ErrorKind::InvalidData)))?;
+        let ident = if offset > line.len() {
+            None
+        } else {
+            let re = regex::Regex::new(r"[\p{L}\p{N}_$]+").unwrap();
+            re.find_iter(&line).find_map(|m| {
+                let whole_ident = m.range().contains(&offset);
+                let last_char_ident = m.range().contains(&offset.saturating_sub(1));
+                (whole_ident | last_char_ident).then_some(m.as_str().to_string())
+            })
+        };
+        Ok(ident)
     }
 }
 
 /// [`lsp`] implementation
 impl Server {
+    async fn definition(self, p: lsp::GotoDefinitionParams) -> Req<R::GotoDefinition> {
+        use async_lsp::{ErrorCode as E, ResponseError as R};
+        let url = p.text_document_position_params.text_document.uri;
+        let position = p.text_document_position_params.position;
+        let ident = self.get_ident(url, position)?;
+        let get_symbol = ident
+            .as_ref()
+            .and_then(|identifier| self.state.symbols.get(identifier));
+
+        let Some(symbol) = get_symbol else {
+            warn!("symbol of `{ident:?}` not found");
+            return Ok(None);
+        };
+
+        let (ident, Some(definition), Some(definition_file_ext)) = (
+            symbol.key(),
+            symbol.definition.clone(),
+            symbol.definition_file_ext.clone(),
+        ) else {
+            warn!("definition of `{}` symbol not found", symbol.key());
+            return Ok(None);
+        };
+
+        let config = self.state.config.try_read();
+        let config = config.map_err(|e| R::new(E::REQUEST_FAILED, e))?;
+        let (config_path, config) = (config.0.clone(), config.1.clone());
+        let path = format!("lsp_proxy_output/{}.{}", config.host, config.database);
+        let output_folder = config_path.parent().unwrap().join(path);
+
+        match std::fs::create_dir_all(&output_folder) {
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(R::new(E::REQUEST_FAILED, err)),
+            Ok(_) => {}
+        };
+
+        let output_file = output_folder.join(ident.to_owned() + &definition_file_ext);
+
+        std::fs::write(&output_file, &definition).map_err(|e| R::new(E::REQUEST_FAILED, e))?;
+
+        let end_line = definition.lines().count() as u32 - 1;
+        let end_offset = definition.lines().last().unwrap().len() as u32 - 1;
+        let end = lsp::Position::new(end_line, end_offset);
+        let range = lsp::Range::new(lsp::Position::new(0, 0), end);
+        let output_file_uri = lsp::Url::from_file_path(output_file).unwrap();
+        let location = lsp::Location::new(output_file_uri, range);
+
+        Ok(Some(lsp::GotoDefinitionResponse::Scalar(location)))
+    }
+
     async fn completion(self, _: lsp::CompletionParams) -> Req<R::Completion> {
         use rayon::iter::*;
         type SymbolRef<'a> = dashmap::mapref::multiple::RefMulti<'a, String, SymbolInfo>;
@@ -194,27 +280,9 @@ impl Server {
     }
 
     async fn hover(self, p: lsp::HoverParams) -> Req<R::HoverRequest> {
-        use async_lsp::{ErrorCode as E, ResponseError as R};
-
-        let fail = |e| R::new(E::REQUEST_FAILED, e);
         let url = p.text_document_position_params.text_document.uri;
         let position = p.text_document_position_params.position;
-        let text_document = self.state.get_text_document(url).map_err(fail)?;
-        let (line_idx, offset) = (position.line as usize, position.character as usize);
-        let line = text_document.get_line(line_idx).map(String::from);
-        let line = line.ok_or(fail(std::io::Error::from(std::io::ErrorKind::InvalidData)))?;
-
-        let ident = if offset > line.len() {
-            None
-        } else {
-            let re = regex::Regex::new(r"[\p{L}\p{N}_$]+").unwrap();
-            re.find_iter(&line).find_map(|m| {
-                let whole_ident = m.range().contains(&offset);
-                let last_char_ident = m.range().contains(&offset.saturating_sub(1));
-                (whole_ident | last_char_ident).then_some(m.as_str().to_string())
-            })
-        };
-
+        let ident = self.get_ident(url, position)?;
         let hover = ident
             .as_ref()
             .and_then(|identifier| self.state.symbols.get(identifier))
@@ -226,7 +294,6 @@ impl Server {
                 }),
                 range: None,
             });
-
         Ok(hover)
     }
 
@@ -283,6 +350,7 @@ async fn main() {
             })
         }
 
+        add_request::<R::GotoDefinition, _, _>(&mut router, Server::definition);
         add_request::<R::Completion, _, _>(&mut router, Server::completion);
         add_request::<R::HoverRequest, _, _>(&mut router, Server::hover);
         add_request::<R::Initialize, _, _>(&mut router, Server::initialize);
