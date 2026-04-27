@@ -99,7 +99,7 @@ impl Server {
         Ok(conn.simple_query(query).await?.into_first_result().await?)
     }
 
-    fn get_config(&self, p: &lsp::InitializeParams) -> std::io::Result<(PathBuf, Config)> {
+    fn parse_config(&self, p: &lsp::InitializeParams) -> std::io::Result<(PathBuf, Config)> {
         use std::io::{Error as E, ErrorKind as EK};
 
         let undefined_config_path_opt = "Initialization options must contains 'configPath' option"; // TODO:
@@ -143,7 +143,7 @@ impl Server {
     }
 
     async fn startup(&self, p: &lsp::InitializeParams) -> std::io::Result<()> {
-        let (config_path, config) = self.get_config(p)?;
+        let (config_path, config) = self.parse_config(p)?;
         let new_pool = deadpool_tiberius::Manager::new()
             .host(&config.host)
             .database(&config.database)
@@ -210,25 +210,33 @@ impl Server {
         Ok(ident)
     }
 
-    fn get_symbol(
+    fn get_config(&self) -> Result<(PathBuf, Config), async_lsp::ResponseError> {
+        use async_lsp::{ErrorCode as E, ResponseError as R};
+        let config = self.state.config.try_read();
+        let config = config.map_err(|e| R::new(E::REQUEST_FAILED, e))?;
+        Ok((config.0.clone(), config.1.clone()))
+    }
+
+    fn get_symbol_by_position(
         &self,
         url: lsp::Url,
         position: lsp::Position,
     ) -> Result<Option<(String, SymbolInfo)>, async_lsp::ResponseError> {
-        use async_lsp::{ErrorCode as E, ResponseError as R};
-
         let Some(ident) = self.get_ident(url, position)? else {
             return Ok(None);
         };
+        self.get_symbol(&ident)
+    }
 
-        let config = self.state.config.try_read();
-        let config = config.map_err(|e| R::new(E::REQUEST_FAILED, e))?;
-        let (_, config) = (config.0.clone(), config.1.clone());
-
+    fn get_symbol(
+        &self,
+        ident: &str,
+    ) -> Result<Option<(String, SymbolInfo)>, async_lsp::ResponseError> {
+        let (_, config) = self.get_config()?;
         let symbol_pair = if config.case_sensitive.unwrap_or(true) {
             self.state
                 .symbols
-                .get(&ident)
+                .get(ident)
                 .map(|s| (s.key().clone(), s.value().clone()))
         } else {
             use rayon::iter::*;
@@ -248,26 +256,13 @@ impl Server {
             Ok(None)
         }
     }
-}
 
-/// [`lsp`] implementation
-impl Server {
-    async fn definition(self, p: lsp::GotoDefinitionParams) -> Req<R::GotoDefinition> {
+    fn emit_symbol_definition(
+        &self,
+        symbol: (String, SymbolInfo),
+    ) -> Result<lsp::Url, async_lsp::ResponseError> {
         use async_lsp::{ErrorCode as E, ResponseError as R};
-        let url = p.text_document_position_params.text_document.uri;
-        let position = p.text_document_position_params.position;
-        let Some((symbol, symbol_info)) = self.get_symbol(url, position)? else {
-            return Ok(None);
-        };
-
-        let (Some(d), Some(ext)) = (symbol_info.definition, symbol_info.definition_file_ext) else {
-            warn!("definition of `{symbol}` symbol not found");
-            return Ok(None);
-        };
-
-        let config = self.state.config.try_read();
-        let config = config.map_err(|e| R::new(E::REQUEST_FAILED, e))?;
-        let (config_path, config) = (config.0.clone(), config.1.clone());
+        let (config_path, config) = self.get_config()?;
         let path = format!("lsp_proxy_output/{}.{}", config.host, config.database);
         let output_folder = config_path.parent().unwrap().join(path);
 
@@ -277,16 +272,69 @@ impl Server {
             Ok(_) => {}
         };
 
-        let output_file = output_folder.join(symbol.to_owned() + &ext);
+        let ext = symbol.1.definition_file_ext;
+        let message = "DefinitionFileExtension not found";
+        let ext = ext.ok_or(R::new(E::REQUEST_FAILED, message))?;
+        let output_file = output_folder.join(symbol.0.to_owned() + &ext);
+        let definition = symbol.1.definition;
+        let definition = definition.ok_or(R::new(E::REQUEST_FAILED, "DefinitionInfo not found"))?;
 
-        std::fs::write(&output_file, &d).map_err(|e| R::new(E::REQUEST_FAILED, e))?;
+        std::fs::write(&output_file, &definition).map_err(|e| R::new(E::REQUEST_FAILED, e))?;
+        Ok(lsp::Url::from_file_path(output_file).unwrap())
+    }
+}
 
-        let end_line = d.lines().count() as u32 - 1;
-        let end_offset = d.lines().last().unwrap().len() as u32 - 1;
-        let end = lsp::Position::new(end_line, end_offset);
-        let range = lsp::Range::new(lsp::Position::new(0, 0), end);
-        let output_file_uri = lsp::Url::from_file_path(output_file).unwrap();
-        let location = lsp::Location::new(output_file_uri, range);
+/// [`lsp`] implementation
+impl Server {
+    #[tracing::instrument(skip_all)]
+    async fn ws_symbol_resolve(self, p: lsp::WorkspaceSymbol) -> Req<R::WorkspaceSymbolResolve> {
+        use async_lsp::{ErrorCode as E, ResponseError as R};
+        let get_symbol = self.get_symbol(&p.name)?;
+        let symbol = get_symbol.ok_or(R::new(E::REQUEST_FAILED, "Expect symbol resolve"))?;
+        let try_emit = self.emit_symbol_definition(symbol);
+        try_emit.inspect_err(|e| error!("emit_symbol_definition error: {e}"))?;
+        Ok(p)
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn ws_symbol(self, _: lsp::WorkspaceSymbolParams) -> Req<R::WorkspaceSymbolRequest> {
+        use rayon::iter::*;
+        type SymbolRef<'a> = dashmap::mapref::multiple::RefMulti<'a, String, SymbolInfo>;
+        let (config_path, config) = self.get_config()?;
+        let path = format!("lsp_proxy_output/{}.{}", config.host, config.database);
+        let output_folder = &config_path.parent().unwrap().join(path);
+        let map = |s: SymbolRef| lsp::WorkspaceSymbol {
+            name: s.key().clone(),
+            kind: lsp::SymbolKind::VARIABLE,
+            tags: None,
+            container_name: None,
+            location: lsp::OneOf::Right(lsp::WorkspaceLocation {
+                uri: lsp::Url::from_file_path(output_folder.join(
+                    s.key().clone() + &s.definition_file_ext.clone().unwrap_or(".md".to_owned()),
+                ))
+                .unwrap(),
+            }),
+            data: None,
+        };
+        let symbols = self.state.symbols.par_iter().map(map).collect();
+        Ok(Some(lsp::WorkspaceSymbolResponse::Nested(symbols)))
+    }
+
+    async fn definition(self, p: lsp::GotoDefinitionParams) -> Req<R::GotoDefinition> {
+        let url = p.text_document_position_params.text_document.uri;
+        let position = p.text_document_position_params.position;
+        let Some((symbol, symbol_info)) = self.get_symbol_by_position(url, position)? else {
+            return Ok(None);
+        };
+
+        if symbol_info.definition.is_none() | symbol_info.definition_file_ext.is_none() {
+            warn!("definition info of `{symbol}` symbol not found");
+            return Ok(None);
+        }
+
+        let zero_range = lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0));
+        let output_file_uri = self.emit_symbol_definition((symbol, symbol_info))?;
+        let location = lsp::Location::new(output_file_uri, zero_range);
 
         Ok(Some(lsp::GotoDefinitionResponse::Scalar(location)))
     }
@@ -309,7 +357,8 @@ impl Server {
     async fn hover(self, p: lsp::HoverParams) -> Req<R::HoverRequest> {
         let url = p.text_document_position_params.text_document.uri;
         let position = p.text_document_position_params.position;
-        let hover = self.get_symbol(url, position)?.map(|(_, info)| lsp::Hover {
+        let symbol = self.get_symbol_by_position(url, position)?;
+        let hover = symbol.map(|(_, info)| lsp::Hover {
             contents: lsp::HoverContents::Markup(lsp::MarkupContent {
                 kind: lsp::MarkupKind::Markdown,
                 value: info.hover.unwrap_or_default(),
@@ -326,9 +375,8 @@ impl Server {
         if let Err(e) = self.startup(&p).await {
             error!("Startup error: {e}");
             let message = "Startup error occured, see output for more details".to_string();
-            let typ = lsp::MessageType::WARNING;
-            let client_socket = self.state.client.get().cloned();
-            client_socket.map(|mut c| c.show_message(lsp::ShowMessageParams { typ, message }));
+            let code = async_lsp::ErrorCode::REQUEST_FAILED;
+            return Err(async_lsp::ResponseError::new(code, message));
         } else {
             info!("Startup success");
         };
@@ -341,6 +389,10 @@ impl Server {
                 hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
                 definition_provider: Some(lsp::OneOf::Left(true)),
                 completion_provider: Some(lsp::CompletionOptions::default()),
+                workspace_symbol_provider: Some(lsp::OneOf::Right(lsp::WorkspaceSymbolOptions {
+                    resolve_provider: Some(true),
+                    work_done_progress_options: lsp::WorkDoneProgressOptions::default(),
+                })),
                 ..lsp::ServerCapabilities::default()
             },
             server_info: Some(async_lsp::lsp_types::ServerInfo {
@@ -372,6 +424,8 @@ async fn main() {
             })
         }
 
+        add_request::<R::WorkspaceSymbolResolve, _, _>(&mut router, Server::ws_symbol_resolve);
+        add_request::<R::WorkspaceSymbolRequest, _, _>(&mut router, Server::ws_symbol);
         add_request::<R::GotoDefinition, _, _>(&mut router, Server::definition);
         add_request::<R::Completion, _, _>(&mut router, Server::completion);
         add_request::<R::HoverRequest, _, _>(&mut router, Server::hover);
@@ -426,6 +480,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(std::io::stderr)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .with_line_number(cfg!(debug_assertions))
         .with_file(cfg!(debug_assertions))
         .with_max_level(cfg_select! {
