@@ -1,6 +1,6 @@
 use async_lsp::LanguageClient;
 use async_lsp::lsp_types::{self as lsp, notification as N, request as R};
-use std::{ops::ControlFlow as F, sync::Arc};
+use std::{ops::ControlFlow as F, path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, warn};
 
 type Req<T> = Result<<T as R::Request>::Result, async_lsp::ResponseError>;
@@ -24,11 +24,11 @@ struct SymbolInfo {
 #[derive(Default)]
 struct ServerState {
     pool: Pool,
-    config: tokio::sync::RwLock<(std::path::PathBuf, Config)>,
+    config: tokio::sync::RwLock<(PathBuf, Config)>,
     client: std::sync::OnceLock<async_lsp::ClientSocket>,
     symbols: dashmap::DashMap<String, SymbolInfo>,
-    url_to_path: dashmap::DashMap<lsp::Url, std::path::PathBuf>,
-    text_documents: dashmap::DashMap<std::path::PathBuf, ropey::Rope>,
+    url_to_path: dashmap::DashMap<lsp::Url, PathBuf>,
+    text_documents: dashmap::DashMap<PathBuf, ropey::Rope>,
 }
 
 struct Server {
@@ -71,7 +71,7 @@ impl ServerState {
         Ok(())
     }
 
-    fn url_to_path(&self, url: lsp::Url) -> std::io::Result<std::path::PathBuf> {
+    fn url_to_path(&self, url: lsp::Url) -> std::io::Result<PathBuf> {
         if let Some(p) = self.url_to_path.get(&url) {
             Ok(p.clone())
         } else {
@@ -98,10 +98,7 @@ impl Server {
         Ok(conn.simple_query(query).await?.into_first_result().await?)
     }
 
-    fn get_config(
-        &self,
-        p: &lsp::InitializeParams,
-    ) -> std::io::Result<(std::path::PathBuf, Config)> {
+    fn get_config(&self, p: &lsp::InitializeParams) -> std::io::Result<(PathBuf, Config)> {
         use std::io::{Error as E, ErrorKind as EK};
 
         let undefined_config_path_opt = "Initialization options must contains 'configPath' option"; // TODO:
@@ -124,7 +121,7 @@ impl Server {
             .as_ref()
             .and_then(|wf| wf.first().cloned())
             .and_then(|f| f.uri.to_file_path().ok())
-            .or_else(|| p.root_path.as_ref().map(std::path::PathBuf::from))
+            .or_else(|| p.root_path.as_ref().map(PathBuf::from))
             .or_else(|| p.root_uri.as_ref().and_then(|url| url.to_file_path().ok()))
             .inspect(|p| info!("Resolved Workspace: {}", p.display()))
             .ok_or(E::new(EK::NotFound, msg))?;
