@@ -178,6 +178,21 @@ impl Server {
 
 /// [`lsp`] implementation
 impl Server {
+    async fn completion(self, _: lsp::CompletionParams) -> Req<R::Completion> {
+        use rayon::iter::*;
+        type SymbolRef<'a> = dashmap::mapref::multiple::RefMulti<'a, String, SymbolInfo>;
+        let map = |s: SymbolRef| lsp::CompletionItem {
+            label: s.key().to_string(),
+            documentation: Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
+                kind: lsp::MarkupKind::Markdown,
+                value: s.hover.clone().unwrap_or_default(),
+            })),
+            ..Default::default()
+        };
+        let completions = self.state.symbols.par_iter().map(map).collect();
+        Ok(Some(lsp::CompletionResponse::Array(completions)))
+    }
+
     async fn hover(self, p: lsp::HoverParams) -> Req<R::HoverRequest> {
         use async_lsp::{ErrorCode as E, ResponseError as R};
 
@@ -236,6 +251,7 @@ impl Server {
                 )),
                 hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
                 definition_provider: Some(lsp::OneOf::Left(true)),
+                completion_provider: Some(lsp::CompletionOptions::default()),
                 ..lsp::ServerCapabilities::default()
             },
             server_info: Some(async_lsp::lsp_types::ServerInfo {
@@ -267,6 +283,7 @@ async fn main() {
             })
         }
 
+        add_request::<R::Completion, _, _>(&mut router, Server::completion);
         add_request::<R::HoverRequest, _, _>(&mut router, Server::hover);
         add_request::<R::Initialize, _, _>(&mut router, Server::initialize);
 
