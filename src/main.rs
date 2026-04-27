@@ -12,9 +12,10 @@ struct Config {
     host: String,
     database: String,
     get_symbols_query: String,
+    case_sensitive: Option<bool>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SymbolInfo {
     hover: Option<String>,
     definition: Option<String>,
@@ -208,6 +209,45 @@ impl Server {
         };
         Ok(ident)
     }
+
+    fn get_symbol(
+        &self,
+        url: lsp::Url,
+        position: lsp::Position,
+    ) -> Result<Option<(String, SymbolInfo)>, async_lsp::ResponseError> {
+        use async_lsp::{ErrorCode as E, ResponseError as R};
+
+        let Some(ident) = self.get_ident(url, position)? else {
+            return Ok(None);
+        };
+
+        let config = self.state.config.try_read();
+        let config = config.map_err(|e| R::new(E::REQUEST_FAILED, e))?;
+        let (_, config) = (config.0.clone(), config.1.clone());
+
+        let symbol_pair = if config.case_sensitive.unwrap_or(true) {
+            self.state
+                .symbols
+                .get(&ident)
+                .map(|s| (s.key().clone(), s.value().clone()))
+        } else {
+            use rayon::iter::*;
+            let ident = ident.to_lowercase();
+            self.state.symbols.par_iter().find_map_first(|s| {
+                s.key()
+                    .to_lowercase()
+                    .eq(&ident)
+                    .then_some((s.key().clone(), s.value().clone()))
+            })
+        };
+
+        if symbol_pair.is_some() {
+            Ok(symbol_pair)
+        } else {
+            warn!("symbol by ident `{ident}` not found");
+            Ok(None)
+        }
+    }
 }
 
 /// [`lsp`] implementation
@@ -216,22 +256,12 @@ impl Server {
         use async_lsp::{ErrorCode as E, ResponseError as R};
         let url = p.text_document_position_params.text_document.uri;
         let position = p.text_document_position_params.position;
-        let ident = self.get_ident(url, position)?;
-        let get_symbol = ident
-            .as_ref()
-            .and_then(|identifier| self.state.symbols.get(identifier));
-
-        let Some(symbol) = get_symbol else {
-            warn!("symbol of `{ident:?}` not found");
+        let Some((symbol, symbol_info)) = self.get_symbol(url, position)? else {
             return Ok(None);
         };
 
-        let (ident, Some(definition), Some(definition_file_ext)) = (
-            symbol.key(),
-            symbol.definition.clone(),
-            symbol.definition_file_ext.clone(),
-        ) else {
-            warn!("definition of `{}` symbol not found", symbol.key());
+        let (Some(d), Some(ext)) = (symbol_info.definition, symbol_info.definition_file_ext) else {
+            warn!("definition of `{symbol}` symbol not found");
             return Ok(None);
         };
 
@@ -247,12 +277,12 @@ impl Server {
             Ok(_) => {}
         };
 
-        let output_file = output_folder.join(ident.to_owned() + &definition_file_ext);
+        let output_file = output_folder.join(symbol.to_owned() + &ext);
 
-        std::fs::write(&output_file, &definition).map_err(|e| R::new(E::REQUEST_FAILED, e))?;
+        std::fs::write(&output_file, &d).map_err(|e| R::new(E::REQUEST_FAILED, e))?;
 
-        let end_line = definition.lines().count() as u32 - 1;
-        let end_offset = definition.lines().last().unwrap().len() as u32 - 1;
+        let end_line = d.lines().count() as u32 - 1;
+        let end_offset = d.lines().last().unwrap().len() as u32 - 1;
         let end = lsp::Position::new(end_line, end_offset);
         let range = lsp::Range::new(lsp::Position::new(0, 0), end);
         let output_file_uri = lsp::Url::from_file_path(output_file).unwrap();
@@ -279,18 +309,13 @@ impl Server {
     async fn hover(self, p: lsp::HoverParams) -> Req<R::HoverRequest> {
         let url = p.text_document_position_params.text_document.uri;
         let position = p.text_document_position_params.position;
-        let ident = self.get_ident(url, position)?;
-        let hover = ident
-            .as_ref()
-            .and_then(|identifier| self.state.symbols.get(identifier))
-            .and_then(|symbol| symbol.hover.clone())
-            .map(|value| lsp::Hover {
-                contents: lsp::HoverContents::Markup(lsp::MarkupContent {
-                    kind: lsp::MarkupKind::Markdown,
-                    value,
-                }),
-                range: None,
-            });
+        let hover = self.get_symbol(url, position)?.map(|(_, info)| lsp::Hover {
+            contents: lsp::HoverContents::Markup(lsp::MarkupContent {
+                kind: lsp::MarkupKind::Markdown,
+                value: info.hover.unwrap_or_default(),
+            }),
+            range: None,
+        });
         Ok(hover)
     }
 
