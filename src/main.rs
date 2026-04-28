@@ -573,9 +573,8 @@ impl Server {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    let (server, _) = async_lsp::MainLoop::new_server(|client| {
+impl Server {
+    fn create(client: async_lsp::ClientSocket) -> async_lsp::router::Router<Arc<ServerState>> {
         let mut router = async_lsp::router::Router::new(Arc::new(ServerState {
             client: client.clone().into(),
             ..ServerState::default()
@@ -638,15 +637,21 @@ async fn main() {
                 ))
             });
 
+        router
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let (server, _) = async_lsp::MainLoop::new_server(|client| {
+        use async_lsp::client_monitor::ClientProcessMonitorLayer;
         tower::ServiceBuilder::new()
             .layer(async_lsp::tracing::TracingLayer::default())
             .layer(async_lsp::server::LifecycleLayer::default())
             .layer(async_lsp::panic::CatchUnwindLayer::default())
             .layer(async_lsp::concurrency::ConcurrencyLayer::default())
-            .layer(async_lsp::client_monitor::ClientProcessMonitorLayer::new(
-                client,
-            ))
-            .service(router)
+            .layer(ClientProcessMonitorLayer::new(client.clone()))
+            .service(Server::create(client))
     });
 
     tracing_subscriber::fmt()
