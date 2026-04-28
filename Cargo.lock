@@ -905,6 +905,7 @@ dependencies = [
  "deadpool-tiberius",
  "dunce",
  "futures",
+ "once_cell",
  "rayon",
  "regex",
  "ropey",

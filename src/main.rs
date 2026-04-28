@@ -1,6 +1,8 @@
 use async_lsp::LanguageClient;
 use async_lsp::lsp_types::{self as lsp, notification as N, request as R};
 use std::{ops::ControlFlow as F, path::PathBuf, sync::Arc};
+
+use rayon::iter::*;
 use tracing::{debug, error, info, warn};
 
 type Req<T> = Result<<T as R::Request>::Result, async_lsp::ResponseError>;
@@ -44,7 +46,7 @@ impl ServerState {
     ) -> std::io::Result<()> {
         let path = self.url_to_path(url)?;
         if changes.len() == 1 && changes[0].range.is_none() {
-            let text_document = ropey::Rope::from_str(changes[0].text.as_str());
+            let text_document = ropey::Rope::from_str(&changes[0].text.replace("\r\n", "\n"));
             self.text_documents.insert(path, text_document);
         } else {
             let err = std::io::Error::from(std::io::ErrorKind::NotFound);
@@ -54,7 +56,7 @@ impl ServerState {
                 let start = td.line_to_char(r.start.line as usize) + r.start.character as usize;
                 let end = td.line_to_char(r.end.line as usize) + r.end.character as usize;
                 td.remove(start..end);
-                td.insert(start, &change.text);
+                td.insert(start, &change.text.replace("\r\n", "\n"));
             }
         }
         Ok(())
@@ -286,6 +288,76 @@ impl Server {
 
 /// [`lsp`] implementation
 impl Server {
+    async fn document_symbol(self, p: lsp::DocumentSymbolParams) -> Req<R::DocumentSymbolRequest> {
+        use async_lsp::{ErrorCode as E, ResponseError as R};
+        let url = p.text_document.uri;
+        let fail = |e| R::new(E::REQUEST_FAILED, e);
+        let (_, config) = self.get_config()?;
+        let case_sensitive = config.case_sensitive.unwrap_or(true);
+        let text_document = self.state.get_text_document(url.clone()).map_err(fail)?;
+        let text_document_by_case_sensitive = match case_sensitive {
+            true => text_document.to_string(),
+            false => text_document.to_string().to_lowercase(),
+        };
+
+        let symbols = self
+            .state
+            .symbols
+            .par_iter()
+            .filter_map(|s| {
+                let symbol = s.key();
+                let symbol_len = u32::try_from(s.key().len()).ok()?;
+                let symbol_by_case_sensitive = match case_sensitive {
+                    true => symbol.to_string(),
+                    false => symbol.to_lowercase(),
+                };
+
+                text_document_by_case_sensitive
+                    .match_indices(&symbol_by_case_sensitive)
+                    .filter_map(|(byte, _)| {
+                        let line_idx = text_document.try_byte_to_line(byte).ok()?;
+                        let line = text_document.get_line(line_idx)?.as_str()?;
+                        let line_idx = u32::try_from(line_idx).ok()?;
+                        let line_by_case_sensitive = match case_sensitive {
+                            true => line.to_string(),
+                            false => line.to_lowercase(),
+                        };
+
+                        let offset = line_by_case_sensitive
+                            .match_indices(&symbol_by_case_sensitive)
+                            .find_map(|(offset, _)| {
+                                let offset = u32::try_from(offset).ok()?;
+                                self.get_ident(url.clone(), lsp::Position::new(line_idx, offset))
+                                    .ok()??
+                                    .len()
+                                    .eq(&(symbol_len as usize))
+                                    .then_some(offset)
+                            })?;
+
+                        let start = lsp::Position::new(line_idx, offset);
+                        let end = lsp::Position::new(line_idx, offset + symbol_len);
+
+                        Some(lsp::DocumentSymbol {
+                            name: symbol.clone(),
+                            range: lsp::Range::new(start, end),
+                            selection_range: lsp::Range::new(start, end),
+                            detail: None,
+                            children: None,
+                            kind: lsp::SymbolKind::VARIABLE,
+                            tags: None,
+                            #[allow(deprecated)]
+                            deprecated: None,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into()
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+
+        Ok(Some(lsp::DocumentSymbolResponse::Nested(symbols)))
+    }
+
     async fn references(self, p: lsp::ReferenceParams) -> Req<R::References> {
         use rayon::iter::*;
         let url = p.text_document_position.text_document.uri;
@@ -469,6 +541,10 @@ impl Server {
                 definition_provider: Some(lsp::OneOf::Left(true)),
                 references_provider: Some(lsp::OneOf::Left(true)),
                 completion_provider: Some(lsp::CompletionOptions::default()),
+                document_symbol_provider: Some(lsp::OneOf::Right(lsp::DocumentSymbolOptions {
+                    label: Some(clap::crate_name!().into()),
+                    work_done_progress_options: lsp::WorkDoneProgressOptions::default(),
+                })),
                 workspace_symbol_provider: Some(lsp::OneOf::Right(lsp::WorkspaceSymbolOptions {
                     resolve_provider: Some(true),
                     work_done_progress_options: lsp::WorkDoneProgressOptions::default(),
@@ -504,6 +580,7 @@ async fn main() {
             })
         }
 
+        add_request::<R::DocumentSymbolRequest, _, _>(&mut router, Server::document_symbol);
         add_request::<R::References, _, _>(&mut router, Server::references);
         add_request::<R::WorkspaceSymbolResolve, _, _>(&mut router, Server::ws_symbol_resolve);
         add_request::<R::WorkspaceSymbolRequest, _, _>(&mut router, Server::ws_symbol);
