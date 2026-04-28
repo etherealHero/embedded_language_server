@@ -9,6 +9,9 @@ type Req<T> = Result<<T as R::Request>::Result, async_lsp::ResponseError>;
 type Pool = Arc<tokio::sync::Mutex<Option<deadpool_tiberius::Pool>>>;
 type _Notify = F<Result<(), async_lsp::Error>>;
 
+static RE_IDENT: once_cell::sync::Lazy<regex::Regex> =
+    once_cell::sync::Lazy::new(|| regex::Regex::new(r"[\p{L}\p{N}_$]+").unwrap());
+
 #[derive(serde::Deserialize, Debug, Default, Clone)]
 struct Config {
     host: String,
@@ -202,8 +205,7 @@ impl Server {
         let ident = if offset > line.len() {
             None
         } else {
-            let re = regex::Regex::new(r"[\p{L}\p{N}_$]+").unwrap();
-            re.find_iter(&line).find_map(|m| {
+            RE_IDENT.find_iter(&line).find_map(|m| {
                 let whole_ident = m.range().contains(&offset);
                 let last_char_ident = m.range().contains(&offset.saturating_sub(1));
                 (whole_ident | last_char_ident).then_some(m.as_str().to_string())
@@ -241,7 +243,6 @@ impl Server {
                 .get(ident)
                 .map(|s| (s.key().clone(), s.value().clone()))
         } else {
-            use rayon::iter::*;
             let ident = ident.to_lowercase();
             self.state.symbols.par_iter().find_map_first(|s| {
                 s.key()
@@ -359,7 +360,6 @@ impl Server {
     }
 
     async fn references(self, p: lsp::ReferenceParams) -> Req<R::References> {
-        use rayon::iter::*;
         let url = p.text_document_position.text_document.uri;
         let position = p.text_document_position.position;
         let Some((symbol_to_search, _)) = self.get_symbol_by_position(url, position)? else {
@@ -441,7 +441,6 @@ impl Server {
     }
 
     async fn ws_symbol(self, _: lsp::WorkspaceSymbolParams) -> Req<R::WorkspaceSymbolRequest> {
-        use rayon::iter::*;
         type SymbolRef<'a> = dashmap::mapref::multiple::RefMulti<'a, String, SymbolInfo>;
         let (config_path, config) = self.get_config()?;
         let path = format!("lsp_proxy_output/{}.{}", config.host, config.database);
@@ -483,7 +482,6 @@ impl Server {
     }
 
     async fn completion(self, _: lsp::CompletionParams) -> Req<R::Completion> {
-        use rayon::iter::*;
         type SymbolRef<'a> = dashmap::mapref::multiple::RefMulti<'a, String, SymbolInfo>;
         let map = |s: SymbolRef| lsp::CompletionItem {
             label: s.key().to_string(),
