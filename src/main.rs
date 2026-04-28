@@ -286,7 +286,79 @@ impl Server {
 
 /// [`lsp`] implementation
 impl Server {
-    #[tracing::instrument(skip_all)]
+    async fn references(self, p: lsp::ReferenceParams) -> Req<R::References> {
+        use rayon::iter::*;
+        let url = p.text_document_position.text_document.uri;
+        let position = p.text_document_position.position;
+        let Some((symbol_to_search, _)) = self.get_symbol_by_position(url, position)? else {
+            return Ok(None);
+        };
+
+        let (config_path, config) = self.get_config()?;
+        let output = format!("lsp_proxy_output/{}.{}", config.host, config.database);
+        let output_folder = config_path.parent().unwrap().join(output);
+        let case_sensitive = config.case_sensitive.unwrap_or(true);
+        let symbol_to_search_len = symbol_to_search.len() as u32;
+        let symbol_to_search = &match case_sensitive {
+            true => symbol_to_search,
+            false => symbol_to_search.to_lowercase(),
+        };
+
+        let locations: Vec<_> = self
+            .state
+            .symbols
+            .par_iter()
+            .filter_map(|symbol| {
+                let ext = symbol.definition_file_ext.clone()?;
+                let filename = symbol.key().to_owned() + &ext;
+                let uri = lsp::Url::from_file_path(output_folder.join(filename)).ok()?;
+                let definition = match case_sensitive {
+                    true => symbol.definition.clone()?,
+                    false => symbol.definition.clone()?.to_lowercase(),
+                };
+
+                let locations: Vec<_> = definition
+                    .lines()
+                    .enumerate()
+                    .par_bridge()
+                    .into_par_iter()
+                    .filter_map(|(line_idx, line): (usize, &str)| {
+                        let line_idx = u32::try_from(line_idx).ok()?;
+                        let line_ranges: Vec<_> = line
+                            .match_indices(symbol_to_search)
+                            .map(|(offset, _)| lsp::Position::new(line_idx, offset as u32))
+                            .map(|start| {
+                                let offset = start.character + symbol_to_search_len;
+                                let end = lsp::Position::new(line_idx, offset);
+                                lsp::Range::new(start, end)
+                            })
+                            .collect();
+                        Some(line_ranges)
+                    })
+                    .collect::<Vec<_>>()
+                    .into_par_iter()
+                    .flatten()
+                    .map(|range| lsp::Location::new(uri.clone(), range))
+                    .collect();
+
+                if !locations.is_empty() {
+                    let symbol = (symbol.key().to_string(), symbol.value().clone());
+                    let msg = "Error on omit symbol reference";
+                    let try_emit = self.emit_symbol_definition(symbol);
+                    try_emit.inspect_err(|e| error!("{msg}: {e}")).ok()?;
+                    Some(locations)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .flatten()
+            .collect();
+
+        Ok(Some(locations))
+    }
+
     async fn ws_symbol_resolve(self, p: lsp::WorkspaceSymbol) -> Req<R::WorkspaceSymbolResolve> {
         use async_lsp::{ErrorCode as E, ResponseError as R};
         let get_symbol = self.get_symbol(&p.name)?;
@@ -296,7 +368,6 @@ impl Server {
         Ok(p)
     }
 
-    #[tracing::instrument(skip_all)]
     async fn ws_symbol(self, _: lsp::WorkspaceSymbolParams) -> Req<R::WorkspaceSymbolRequest> {
         use rayon::iter::*;
         type SymbolRef<'a> = dashmap::mapref::multiple::RefMulti<'a, String, SymbolInfo>;
@@ -371,6 +442,14 @@ impl Server {
     async fn initialize(self, p: lsp::InitializeParams) -> Req<R::Initialize> {
         info!("{} v{}", clap::crate_name!(), clap::crate_version!());
         debug!("initialization_options `{:#?}`", p.initialization_options);
+        debug!(
+            "token_types `{:#?}`",
+            p.capabilities
+                .text_document
+                .as_ref()
+                .and_then(|c| c.semantic_tokens.as_ref())
+                .map(|c| &c.token_types)
+        );
 
         if let Err(e) = self.startup(&p).await {
             error!("Startup error: {e}");
@@ -388,6 +467,7 @@ impl Server {
                 )),
                 hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
                 definition_provider: Some(lsp::OneOf::Left(true)),
+                references_provider: Some(lsp::OneOf::Left(true)),
                 completion_provider: Some(lsp::CompletionOptions::default()),
                 workspace_symbol_provider: Some(lsp::OneOf::Right(lsp::WorkspaceSymbolOptions {
                     resolve_provider: Some(true),
@@ -424,6 +504,7 @@ async fn main() {
             })
         }
 
+        add_request::<R::References, _, _>(&mut router, Server::references);
         add_request::<R::WorkspaceSymbolResolve, _, _>(&mut router, Server::ws_symbol_resolve);
         add_request::<R::WorkspaceSymbolRequest, _, _>(&mut router, Server::ws_symbol);
         add_request::<R::GotoDefinition, _, _>(&mut router, Server::definition);
