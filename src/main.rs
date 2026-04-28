@@ -93,15 +93,32 @@ impl ServerState {
 impl Server {
     async fn query(
         &self,
-        query: &str, // TODO: add timeout (with config option)
+        query: &str,
     ) -> deadpool_tiberius::SqlServerResult<Vec<deadpool_tiberius::tiberius::Row>> {
-        use deadpool_tiberius::{SqlServerError as SSE, deadpool::managed::BuildError as BE};
+        use deadpool_tiberius::{SqlServerError as SSE, deadpool::managed as M};
         let lock_fail = |e| SSE::Io(std::io::Error::new(std::io::ErrorKind::ResourceBusy, e));
         let try_lock = self.state.pool.try_lock();
         let pool = try_lock.map_err(lock_fail)?.as_ref().cloned();
-        let pool = pool.ok_or(SSE::PoolBuild(BE::NoRuntimeSpecified))?;
-        let mut conn = pool.get().await?;
-        Ok(conn.simple_query(query).await?.into_first_result().await?)
+        let pool = pool.ok_or(SSE::PoolBuild(M::BuildError::NoRuntimeSpecified))?;
+        let pool_timeouts = M::Timeouts {
+            wait: Some(std::time::Duration::from_secs(10)),
+            create: Some(std::time::Duration::from_secs(10)),
+            recycle: Some(std::time::Duration::from_secs(10)),
+        };
+
+        info!("execute query...");
+        let mut conn = pool.timeout_get(&pool_timeouts).await?;
+        let running_query = async { conn.simple_query(query).await?.into_first_result().await };
+        let timeout_duration = std::time::Duration::from_secs(10);
+        let Ok(result) = tokio::time::timeout(timeout_duration, running_query).await else {
+            M::Object::take(conn).close().await?; // cancel query
+            return Err(SSE::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "execute query timeout",
+            )));
+        };
+
+        Ok(result?)
     }
 
     fn parse_config(&self, p: &lsp::InitializeParams) -> std::io::Result<(PathBuf, Config)> {
@@ -166,14 +183,13 @@ impl Server {
         } // lock free
 
         let rows = self.query(&config.get_symbols_query).await;
-        let result = rows.inspect_err(|e| error!("Query error: {e}"));
         let missing_column = "Column 'Identifier' must present in get_symbols_query";
         let get_prop = |row: &deadpool_tiberius::tiberius::Row, prop: &str| {
             let try_get_prop = row.try_get::<&str, &str>(prop);
             try_get_prop.unwrap_or_default().map(String::from)
         };
 
-        for row in result.unwrap_or_default() {
+        for row in rows.map_err(std::io::Error::other)? {
             let try_ident = row.try_get::<&str, &str>("Identifier");
             let ident = try_ident.map_err(std::io::Error::other)?;
             let ident = ident.ok_or_else(|| std::io::Error::other(missing_column))?;
