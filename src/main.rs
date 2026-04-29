@@ -195,29 +195,37 @@ impl Server {
         Ok(())
     }
 
-    fn get_ident(&self, url: lsp::Url, position: lsp::Position) -> Result<Option<String>> {
+    fn get_ident_on_text_document(
+        &self,
+        url: lsp::Url,
+        position: lsp::Position,
+    ) -> Result<Option<String>> {
         let text_document = self.state.get_text_document(url)?;
-        let (line_idx, offset) = (position.line as usize, position.character as usize);
+        let line_idx = position.line as usize;
         let line = text_document.get_line(line_idx).map(String::from);
         let line = line.ok_or(anyhow!("line_idx is out of bounds"))?;
-        let ident = if offset > line.len() {
+        Ok(self.get_ident_on_line(&line, position))
+    }
+
+    fn get_ident_on_line(&self, line: &str, position: lsp::Position) -> Option<String> {
+        let offset = position.character as usize;
+        if offset > line.len() {
             None
         } else {
-            RE_IDENT.find_iter(&line).find_map(|m| {
+            RE_IDENT.find_iter(line).find_map(|m| {
                 let whole_ident = m.range().contains(&offset);
                 let last_char_ident = m.range().contains(&offset.saturating_sub(1));
                 (whole_ident | last_char_ident).then_some(m.as_str().to_string())
             })
-        };
-        Ok(ident)
+        }
     }
 
-    fn get_symbol_by_position(
+    fn get_symbol_on_text_document(
         &self,
         url: lsp::Url,
         position: lsp::Position,
     ) -> Result<Option<(String, SymbolInfo)>> {
-        self.get_ident(url, position)?
+        self.get_ident_on_text_document(url, position)?
             .map(|ident| self.get_symbol(&ident))
             .unwrap_or(Ok(None))
     }
@@ -306,7 +314,8 @@ impl Server {
                             .match_indices(&symbol_by_case_sensitive)
                             .find_map(|(offset, _)| {
                                 let offset = u32::try_from(offset).ok()?;
-                                self.get_ident(url.clone(), lsp::Position::new(line_idx, offset))
+                                let position = lsp::Position::new(line_idx, offset);
+                                self.get_ident_on_text_document(url.clone(), position)
                                     .ok()??
                                     .len()
                                     .eq(&(symbol_len as usize))
@@ -342,7 +351,7 @@ impl Server {
 
         let url = p.text_document_position.text_document.uri;
         let position = p.text_document_position.position;
-        let Some((symbol_to_search, _)) = self.get_symbol_by_position(url, position)? else {
+        let Some((symbol_to_search, _)) = self.get_symbol_on_text_document(url, position)? else {
             return Ok(None);
         };
 
@@ -365,12 +374,12 @@ impl Server {
                 let ext = symbol.definition_file_ext.clone()?;
                 let filename = symbol.key().to_owned() + &ext;
                 let uri = lsp::Url::from_file_path(output_folder.join(filename)).ok()?;
-                let definition = match case_sensitive {
+                let definition_by_case_sensitive = match case_sensitive {
                     true => symbol.definition.clone()?,
                     false => symbol.definition.clone()?.to_lowercase(),
                 };
 
-                let locations: Vec<_> = definition
+                let locations: Vec<_> = definition_by_case_sensitive
                     .lines()
                     .enumerate()
                     .par_bridge()
@@ -380,10 +389,13 @@ impl Server {
                         let line_ranges: Vec<_> = line
                             .match_indices(symbol_to_search)
                             .map(|(offset, _)| lsp::Position::new(line_idx, offset as u32))
-                            .map(|start| {
-                                let offset = start.character + symbol_to_search_len;
-                                let end = lsp::Position::new(line_idx, offset);
-                                lsp::Range::new(start, end)
+                            .filter_map(|start| {
+                                let character = start.character + symbol_to_search_len;
+                                let end = lsp::Position::new(line_idx, character);
+                                self.get_ident_on_line(line, start)?
+                                    .len()
+                                    .eq(&(symbol_to_search_len as usize))
+                                    .then_some(lsp::Range::new(start, end))
                             })
                             .collect();
                         Some(line_ranges)
@@ -446,7 +458,7 @@ impl Server {
     async fn definition(self, p: lsp::GotoDefinitionParams) -> Req<R::GotoDefinition> {
         let url = p.text_document_position_params.text_document.uri;
         let position = p.text_document_position_params.position;
-        let Some((symbol, symbol_info)) = self.get_symbol_by_position(url, position)? else {
+        let Some((symbol, symbol_info)) = self.get_symbol_on_text_document(url, position)? else {
             return Ok(None);
         };
         ensure!(symbol_info.definition_file_ext.is_some() & symbol_info.definition.is_some());
@@ -478,7 +490,7 @@ impl Server {
     async fn hover(self, p: lsp::HoverParams) -> Req<R::HoverRequest> {
         let url = p.text_document_position_params.text_document.uri;
         let position = p.text_document_position_params.position;
-        let symbol = self.get_symbol_by_position(url, position)?;
+        let symbol = self.get_symbol_on_text_document(url, position)?;
         let hover = symbol.map(|(_, info)| lsp::Hover {
             contents: lsp::HoverContents::Markup(lsp::MarkupContent {
                 kind: lsp::MarkupKind::Markdown,
