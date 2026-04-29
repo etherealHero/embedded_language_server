@@ -438,20 +438,19 @@ impl Server {
         let path = format!("lsp_proxy_output/{}.{}", config.host, config.database);
         let config_path = self.state.config_path.get().unwrap();
         let output_folder = &config_path.parent().unwrap().join(path);
-        let map = |s: SymbolRef| lsp::WorkspaceSymbol {
-            name: s.key().clone(),
-            kind: lsp::SymbolKind::VARIABLE,
-            tags: None,
-            container_name: None,
-            location: lsp::OneOf::Right(lsp::WorkspaceLocation {
-                uri: lsp::Url::from_file_path(output_folder.join(
-                    s.key().clone() + &s.definition_file_ext.clone().unwrap_or(".md".to_owned()),
-                ))
-                .unwrap(),
-            }),
-            data: None,
+        let map = |s: SymbolRef| {
+            let ext = s.definition_file_ext.as_ref()?;
+            let uri = lsp::Url::from_file_path(output_folder.join(s.key().clone() + ext)).ok()?;
+            Some(lsp::WorkspaceSymbol {
+                location: lsp::OneOf::Right(lsp::WorkspaceLocation { uri }),
+                kind: lsp::SymbolKind::VARIABLE,
+                name: s.key().clone(),
+                container_name: None,
+                tags: None,
+                data: None,
+            })
         };
-        let symbols = self.state.symbols.par_iter().map(map).collect();
+        let symbols = self.state.symbols.par_iter().filter_map(map).collect();
         Ok(Some(lsp::WorkspaceSymbolResponse::Nested(symbols)))
     }
 
