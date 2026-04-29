@@ -1,13 +1,16 @@
-use async_lsp::LanguageClient;
-use async_lsp::lsp_types::{self as lsp, notification as N, request as R};
+use anyhow::{Result, anyhow, bail, ensure};
 use std::{ops::ControlFlow as F, path::PathBuf, sync::Arc};
-
-use rayon::iter::*;
 use tracing::{debug, error, info, warn};
 
-type Req<T> = Result<<T as R::Request>::Result, async_lsp::ResponseError>;
-type Pool = Arc<tokio::sync::Mutex<Option<deadpool_tiberius::Pool>>>;
-type _Notify = F<Result<(), async_lsp::Error>>;
+use async_lsp::LanguageClient;
+use async_lsp::lsp_types::{self as lsp, notification as N, request as R};
+use deadpool_tiberius as dt;
+use rayon::iter::*;
+
+type Req<T> = std::result::Result<<T as R::Request>::Result, anyhow::Error>;
+type Pool = Arc<tokio::sync::Mutex<Option<dt::Pool>>>;
+type SymbolRef<'a> = dashmap::mapref::multiple::RefMulti<'a, String, SymbolInfo>;
+type _Notify = F<std::result::Result<(), async_lsp::Error>>;
 
 static RE_IDENT: once_cell::sync::Lazy<regex::Regex> =
     once_cell::sync::Lazy::new(|| regex::Regex::new(r"[\p{L}\p{N}_$]+").unwrap());
@@ -30,7 +33,8 @@ struct SymbolInfo {
 #[derive(Default)]
 struct ServerState {
     pool: Pool,
-    config: tokio::sync::RwLock<(PathBuf, Config)>,
+    config: tokio::sync::RwLock<Config>,
+    config_path: std::sync::OnceLock<PathBuf>,
     client: std::sync::OnceLock<async_lsp::ClientSocket>,
     symbols: dashmap::DashMap<String, SymbolInfo>,
     url_to_path: dashmap::DashMap<lsp::Url, PathBuf>,
@@ -46,13 +50,13 @@ impl ServerState {
         &self,
         url: lsp::Url,
         changes: &[lsp::TextDocumentContentChangeEvent],
-    ) -> std::io::Result<()> {
+    ) -> Result<()> {
         let path = self.url_to_path(url)?;
         if changes.len() == 1 && changes[0].range.is_none() {
             let text_document = ropey::Rope::from_str(&changes[0].text.replace("\r\n", "\n"));
             self.text_documents.insert(path, text_document);
         } else {
-            let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+            let err = anyhow!("text document not found");
             let td = &mut self.text_documents.get_mut(&path).ok_or(err)?;
             for change in changes {
                 let r = change.range.as_ref().unwrap();
@@ -65,24 +69,24 @@ impl ServerState {
         Ok(())
     }
 
-    fn get_text_document(&self, url: lsp::Url) -> std::io::Result<ropey::Rope> {
+    fn get_text_document(&self, url: lsp::Url) -> Result<ropey::Rope> {
         self.text_documents
             .get(&self.url_to_path(url)?)
             .map(|text_document| text_document.clone())
-            .ok_or(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .ok_or(anyhow!("text document not found"))
     }
 
-    fn remove_text_document(&self, url: lsp::Url) -> std::io::Result<()> {
+    fn remove_text_document(&self, url: lsp::Url) -> Result<()> {
         self.text_documents.remove(&self.url_to_path(url)?);
         Ok(())
     }
 
-    fn url_to_path(&self, url: lsp::Url) -> std::io::Result<PathBuf> {
+    fn url_to_path(&self, url: lsp::Url) -> Result<PathBuf> {
         if let Some(p) = self.url_to_path.get(&url) {
             Ok(p.clone())
         } else {
             let path = url.to_file_path();
-            let path = path.map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+            let path = path.map_err(|_| anyhow!("url to file path fail"))?;
             let path = dunce::canonicalize(dunce::simplified(&path))?;
             self.url_to_path.insert(url, path.clone());
             Ok(path)
@@ -91,16 +95,10 @@ impl ServerState {
 }
 
 impl Server {
-    async fn query(
-        &self,
-        query: &str,
-    ) -> deadpool_tiberius::SqlServerResult<Vec<deadpool_tiberius::tiberius::Row>> {
-        use deadpool_tiberius::{SqlServerError as SSE, deadpool::managed as M};
-        let lock_fail = |e| SSE::Io(std::io::Error::new(std::io::ErrorKind::ResourceBusy, e));
-        let try_lock = self.state.pool.try_lock();
-        let pool = try_lock.map_err(lock_fail)?.as_ref().cloned();
-        let pool = pool.ok_or(SSE::PoolBuild(M::BuildError::NoRuntimeSpecified))?;
-        let pool_timeouts = M::Timeouts {
+    async fn query(&self, query: &str) -> Result<Vec<dt::tiberius::Row>> {
+        let pool = self.state.pool.try_lock()?.as_ref().cloned();
+        let pool = pool.ok_or(anyhow!("connection pool not initialized"))?;
+        let pool_timeouts = dt::deadpool::managed::Timeouts {
             wait: Some(std::time::Duration::from_secs(10)),
             create: Some(std::time::Duration::from_secs(10)),
             recycle: Some(std::time::Duration::from_secs(10)),
@@ -111,24 +109,18 @@ impl Server {
         let running_query = async { conn.simple_query(query).await?.into_first_result().await };
         let timeout_duration = std::time::Duration::from_secs(10);
         let Ok(result) = tokio::time::timeout(timeout_duration, running_query).await else {
-            M::Object::take(conn).close().await?; // cancel query
-            return Err(SSE::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "execute query timeout",
-            )));
+            dt::deadpool::managed::Object::take(conn).close().await?;
+            bail!("execute query timeout")
         };
 
         Ok(result?)
     }
 
-    fn parse_config(&self, p: &lsp::InitializeParams) -> std::io::Result<(PathBuf, Config)> {
-        use std::io::{Error as E, ErrorKind as EK};
-
-        let undefined_config_path_opt = "Initialization options must contains 'configPath' option"; // TODO:
+    fn parse_config(&self, p: &lsp::InitializeParams) -> Result<(PathBuf, Config)> {
         let options = p.initialization_options.as_ref();
         let config_path = options.and_then(|v| v["configPath"].as_str().map(String::from));
-        let config_path = &config_path.ok_or(E::new(EK::NotFound, undefined_config_path_opt))?;
-        let msg = concat!(
+        let config_path = &config_path.ok_or(anyhow!("missing 'configPath' initialize option"))?;
+        let resolve_workspace_fail_message = concat!(
             "Resolve workspace folder fail. ",
             "Language Client does not provide any workspace folder options ",
             "(workspace_folders, root_path, root_uri). ",
@@ -146,53 +138,48 @@ impl Server {
             .and_then(|f| f.uri.to_file_path().ok())
             .or_else(|| p.root_path.as_ref().map(PathBuf::from))
             .or_else(|| p.root_uri.as_ref().and_then(|url| url.to_file_path().ok()))
-            .inspect(|p| info!("Resolved Workspace: {}", p.display()))
-            .ok_or(E::new(EK::NotFound, msg))?;
+            .inspect(|p| info!("resolved Workspace: {}", p.display()))
+            .ok_or(anyhow!(resolve_workspace_fail_message))?;
 
-        info!("Resolved config path: {}", root.join(config_path).display());
+        info!("resolved config path: {}", root.join(config_path).display());
 
         let path = root.join(config_path);
-        let try_exists = path.try_exists()?;
-        let try_exists = try_exists.eq(&true).then_some(1);
+        let try_exists = path.try_exists()?.eq(&true).then_some(1);
 
-        try_exists.ok_or(E::new(EK::NotFound, "Config file not exists"))?;
-        info!("Found config: {}", path.display());
+        try_exists.ok_or(anyhow!("config file not exists"))?;
+        info!("found config: {}", path.display());
 
         let raw_config = std::fs::read(&path).map(|b| String::from_utf8_lossy(&b).into_owned())?;
-        let config = toml::from_str(&raw_config).map_err(|e| E::new(EK::InvalidData, e))?;
+        let config = toml::from_str(&raw_config).map_err(|e| anyhow!("parse config error: {e}"))?;
 
         Ok((path, config))
     }
 
-    async fn startup(&self, p: &lsp::InitializeParams) -> std::io::Result<()> {
+    async fn startup(&self, p: &lsp::InitializeParams) -> Result<()> {
         let (config_path, config) = self.parse_config(p)?;
-        let new_pool = deadpool_tiberius::Manager::new()
+        let new_pool = dt::Manager::new()
             .host(&config.host)
             .database(&config.database)
-            .authentication(deadpool_tiberius::tiberius::AuthMethod::Integrated)
+            .authentication(dt::tiberius::AuthMethod::Integrated)
             .trust_cert()
             .wait_timeout(std::time::Duration::from_secs(5))
             .create_pool()
-            .inspect_err(|e| error!("Create pool error: {e}"))
-            .map_err(std::io::Error::other)?;
+            .inspect_err(|e| error!("create pool error: {e}"))?;
 
         {
             let mut unit_pool = self.state.pool.lock().await;
             *unit_pool = Some(new_pool);
-            info!("Create pool success: {}.{}", config.host, config.database)
+            info!("create pool success: {}.{}", config.host, config.database)
         } // lock free
 
-        let rows = self.query(&config.get_symbols_query).await;
-        let missing_column = "Column 'Identifier' must present in get_symbols_query";
-        let get_prop = |row: &deadpool_tiberius::tiberius::Row, prop: &str| {
+        let get_prop = |row: &dt::tiberius::Row, prop: &str| {
             let try_get_prop = row.try_get::<&str, &str>(prop);
             try_get_prop.unwrap_or_default().map(String::from)
         };
 
-        for row in rows.map_err(std::io::Error::other)? {
-            let try_ident = row.try_get::<&str, &str>("Identifier");
-            let ident = try_ident.map_err(std::io::Error::other)?;
-            let ident = ident.ok_or_else(|| std::io::Error::other(missing_column))?;
+        for row in self.query(&config.get_symbols_query).await? {
+            let ident = row.try_get::<&str, &str>("Identifier")?;
+            let ident = ident.ok_or_else(|| anyhow!("'Identifier' column must be string"))?;
             let symbol = SymbolInfo {
                 hover: get_prop(&row, "HoverInfo"),
                 definition: get_prop(&row, "DefinitionInfo"),
@@ -202,22 +189,17 @@ impl Server {
         }
 
         let mut uninit_config = self.state.config.write().await;
-        *uninit_config = (config_path, config);
+        *uninit_config = config;
+        ensure!(self.state.config_path.set(config_path).is_ok());
 
         Ok(())
     }
 
-    fn get_ident(
-        &self,
-        url: lsp::Url,
-        position: lsp::Position,
-    ) -> Result<Option<String>, async_lsp::ResponseError> {
-        use async_lsp::{ErrorCode as E, ResponseError as R};
-        let fail = |e| R::new(E::REQUEST_FAILED, e);
-        let text_document = self.state.get_text_document(url).map_err(fail)?;
+    fn get_ident(&self, url: lsp::Url, position: lsp::Position) -> Result<Option<String>> {
+        let text_document = self.state.get_text_document(url)?;
         let (line_idx, offset) = (position.line as usize, position.character as usize);
         let line = text_document.get_line(line_idx).map(String::from);
-        let line = line.ok_or(fail(std::io::Error::from(std::io::ErrorKind::InvalidData)))?;
+        let line = line.ok_or(anyhow!("line_idx is out of bounds"))?;
         let ident = if offset > line.len() {
             None
         } else {
@@ -230,30 +212,18 @@ impl Server {
         Ok(ident)
     }
 
-    fn get_config(&self) -> Result<(PathBuf, Config), async_lsp::ResponseError> {
-        use async_lsp::{ErrorCode as E, ResponseError as R};
-        let config = self.state.config.try_read();
-        let config = config.map_err(|e| R::new(E::REQUEST_FAILED, e))?;
-        Ok((config.0.clone(), config.1.clone()))
-    }
-
     fn get_symbol_by_position(
         &self,
         url: lsp::Url,
         position: lsp::Position,
-    ) -> Result<Option<(String, SymbolInfo)>, async_lsp::ResponseError> {
-        let Some(ident) = self.get_ident(url, position)? else {
-            return Ok(None);
-        };
-        self.get_symbol(&ident)
+    ) -> Result<Option<(String, SymbolInfo)>> {
+        self.get_ident(url, position)?
+            .map(|ident| self.get_symbol(&ident))
+            .unwrap_or(Ok(None))
     }
 
-    fn get_symbol(
-        &self,
-        ident: &str,
-    ) -> Result<Option<(String, SymbolInfo)>, async_lsp::ResponseError> {
-        let (_, config) = self.get_config()?;
-        let symbol_pair = if config.case_sensitive.unwrap_or(true) {
+    fn get_symbol(&self, ident: &str) -> Result<Option<(String, SymbolInfo)>> {
+        let symbol_pair = if self.state.config.try_read()?.case_sensitive.unwrap_or(true) {
             self.state
                 .symbols
                 .get(ident)
@@ -276,42 +246,34 @@ impl Server {
         }
     }
 
-    fn emit_symbol_definition(
-        &self,
-        symbol: (String, SymbolInfo),
-    ) -> Result<lsp::Url, async_lsp::ResponseError> {
-        use async_lsp::{ErrorCode as E, ResponseError as R};
-        let (config_path, config) = self.get_config()?;
-        let path = format!("lsp_proxy_output/{}.{}", config.host, config.database);
-        let output_folder = config_path.parent().unwrap().join(path);
+    fn emit_symbol_definition(&self, symbol: (String, SymbolInfo)) -> Result<lsp::Url> {
+        ensure!(self.state.config_path.get().is_some());
 
-        match std::fs::create_dir_all(&output_folder) {
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(R::new(E::REQUEST_FAILED, err)),
-            Ok(_) => {}
+        let config = self.state.config.try_read()?;
+        let path = format!("lsp_proxy_output/{}.{}", config.host, config.database);
+        let config_path = self.state.config_path.get().unwrap();
+        let output_folder = config_path.parent().unwrap().join(path);
+        let symbol_info = &symbol.1;
+
+        if !std::fs::exists(&output_folder)? {
+            std::fs::create_dir_all(&output_folder)?
         };
 
-        let ext = symbol.1.definition_file_ext;
-        let message = "DefinitionFileExtension not found";
-        let ext = ext.ok_or(R::new(E::REQUEST_FAILED, message))?;
-        let output_file = output_folder.join(symbol.0.to_owned() + &ext);
-        let definition = symbol.1.definition;
-        let definition = definition.ok_or(R::new(E::REQUEST_FAILED, "DefinitionInfo not found"))?;
+        ensure!(symbol_info.definition_file_ext.is_some() & symbol_info.definition.is_some());
 
-        std::fs::write(&output_file, &definition).map_err(|e| R::new(E::REQUEST_FAILED, e))?;
-        Ok(lsp::Url::from_file_path(output_file).unwrap())
+        let file = output_folder.join(symbol.0.to_owned() + &symbol.1.definition_file_ext.unwrap());
+
+        std::fs::write(&file, symbol.1.definition.unwrap())?;
+        Ok(lsp::Url::from_file_path(file).unwrap())
     }
 }
 
 /// [`lsp`] implementation
 impl Server {
     async fn document_symbol(self, p: lsp::DocumentSymbolParams) -> Req<R::DocumentSymbolRequest> {
-        use async_lsp::{ErrorCode as E, ResponseError as R};
         let url = p.text_document.uri;
-        let fail = |e| R::new(E::REQUEST_FAILED, e);
-        let (_, config) = self.get_config()?;
-        let case_sensitive = config.case_sensitive.unwrap_or(true);
-        let text_document = self.state.get_text_document(url.clone()).map_err(fail)?;
+        let case_sensitive = self.state.config.try_read()?.case_sensitive.unwrap_or(true);
+        let text_document = self.state.get_text_document(url.clone())?;
         let text_document_by_case_sensitive = match case_sensitive {
             true => text_document.to_string(),
             false => text_document.to_string().to_lowercase(),
@@ -376,14 +338,17 @@ impl Server {
     }
 
     async fn references(self, p: lsp::ReferenceParams) -> Req<R::References> {
+        ensure!(self.state.config_path.get().is_some());
+
         let url = p.text_document_position.text_document.uri;
         let position = p.text_document_position.position;
         let Some((symbol_to_search, _)) = self.get_symbol_by_position(url, position)? else {
             return Ok(None);
         };
 
-        let (config_path, config) = self.get_config()?;
+        let config = self.state.config.try_read()?;
         let output = format!("lsp_proxy_output/{}.{}", config.host, config.database);
+        let config_path = self.state.config_path.get().unwrap();
         let output_folder = config_path.parent().unwrap().join(output);
         let case_sensitive = config.case_sensitive.unwrap_or(true);
         let symbol_to_search_len = symbol_to_search.len() as u32;
@@ -448,18 +413,18 @@ impl Server {
     }
 
     async fn ws_symbol_resolve(self, p: lsp::WorkspaceSymbol) -> Req<R::WorkspaceSymbolResolve> {
-        use async_lsp::{ErrorCode as E, ResponseError as R};
         let get_symbol = self.get_symbol(&p.name)?;
-        let symbol = get_symbol.ok_or(R::new(E::REQUEST_FAILED, "Expect symbol resolve"))?;
+        let symbol = get_symbol.ok_or_else(|| anyhow!("Expect symbol resolve"))?;
         let try_emit = self.emit_symbol_definition(symbol);
         try_emit.inspect_err(|e| error!("emit_symbol_definition error: {e}"))?;
         Ok(p)
     }
 
     async fn ws_symbol(self, _: lsp::WorkspaceSymbolParams) -> Req<R::WorkspaceSymbolRequest> {
-        type SymbolRef<'a> = dashmap::mapref::multiple::RefMulti<'a, String, SymbolInfo>;
-        let (config_path, config) = self.get_config()?;
+        ensure!(self.state.config_path.get().is_some());
+        let config = self.state.config.try_read()?;
         let path = format!("lsp_proxy_output/{}.{}", config.host, config.database);
+        let config_path = self.state.config_path.get().unwrap();
         let output_folder = &config_path.parent().unwrap().join(path);
         let map = |s: SymbolRef| lsp::WorkspaceSymbol {
             name: s.key().clone(),
@@ -484,12 +449,12 @@ impl Server {
         let Some((symbol, symbol_info)) = self.get_symbol_by_position(url, position)? else {
             return Ok(None);
         };
+        ensure!(symbol_info.definition_file_ext.is_some() & symbol_info.definition.is_some());
 
         if symbol_info.definition.is_none() | symbol_info.definition_file_ext.is_none() {
             warn!("definition info of `{symbol}` symbol not found");
             return Ok(None);
         }
-
         let zero_range = lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0));
         let output_file_uri = self.emit_symbol_definition((symbol, symbol_info))?;
         let location = lsp::Location::new(output_file_uri, zero_range);
@@ -498,7 +463,6 @@ impl Server {
     }
 
     async fn completion(self, _: lsp::CompletionParams) -> Req<R::Completion> {
-        type SymbolRef<'a> = dashmap::mapref::multiple::RefMulti<'a, String, SymbolInfo>;
         let map = |s: SymbolRef| lsp::CompletionItem {
             label: s.key().to_string(),
             documentation: Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
@@ -527,6 +491,7 @@ impl Server {
 
     async fn initialize(self, p: lsp::InitializeParams) -> Req<R::Initialize> {
         info!("{} v{}", clap::crate_name!(), clap::crate_version!());
+
         debug!("initialization_options `{:#?}`", p.initialization_options);
         debug!(
             "token_types `{:#?}`",
@@ -537,14 +502,7 @@ impl Server {
                 .map(|c| &c.token_types)
         );
 
-        if let Err(e) = self.startup(&p).await {
-            error!("Startup error: {e}");
-            let message = "Startup error occured, see output for more details".to_string();
-            let code = async_lsp::ErrorCode::REQUEST_FAILED;
-            return Err(async_lsp::ResponseError::new(code, message));
-        } else {
-            info!("Startup success");
-        };
+        self.startup(&p).await?;
 
         Ok(lsp::InitializeResult {
             capabilities: lsp::ServerCapabilities {
@@ -565,7 +523,7 @@ impl Server {
                 })),
                 ..lsp::ServerCapabilities::default()
             },
-            server_info: Some(async_lsp::lsp_types::ServerInfo {
+            server_info: Some(lsp::ServerInfo {
                 name: clap::crate_name!().to_string(),
                 version: Some(clap::crate_version!().to_string()),
             }),
@@ -575,8 +533,10 @@ impl Server {
 
 impl Server {
     fn create(client: async_lsp::ClientSocket) -> async_lsp::router::Router<Arc<ServerState>> {
+        use std::io::Error as E;
+
         let mut router = async_lsp::router::Router::new(Arc::new(ServerState {
-            client: client.clone().into(),
+            client: client.into(),
             ..ServerState::default()
         }));
 
@@ -588,8 +548,10 @@ impl Server {
             H: Fn(Server, T::Params) -> Fut + Send + Sync + 'static,
         {
             router.request::<T, _>(move |st: &mut Arc<ServerState>, p| {
+                use futures::TryFutureExt;
                 let state = Arc::clone(st);
-                handler(Server { state }, p)
+                let f = |e| async_lsp::ResponseError::new(async_lsp::ErrorCode::REQUEST_FAILED, e);
+                handler(Server { state }, p).map_err(f)
             })
         }
 
@@ -611,19 +573,20 @@ impl Server {
                     range_length: None,
                     range: None,
                 };
+
                 st.set_text_document(p.text_document.uri, &[event])
                     .inspect_err(|e| error!("Did open text document error: {e}"))
-                    .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
+                    .map_or_else(|e| F::Break(Err(E::other(e).into())), |_| F::Continue(()))
             })
             .notification::<N::DidChangeTextDocument>(|st, p| {
                 st.set_text_document(p.text_document.uri, &p.content_changes)
                     .inspect_err(|e| error!("did change text document error: {e}"))
-                    .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
+                    .map_or_else(|e| F::Break(Err(E::other(e).into())), |_| F::Continue(()))
             })
             .notification::<N::DidCloseTextDocument>(|st, p| {
                 st.remove_text_document(p.text_document.uri)
                     .inspect_err(|e| error!("did close text document error: {e}"))
-                    .map_or_else(|e| F::Break(Err(e.into())), |_| F::Continue(()))
+                    .map_or_else(|e| F::Break(Err(E::other(e).into())), |_| F::Continue(()))
             })
             .unhandled_notification(|_, notify| {
                 warn!("unhandled_notification `{}`", notify.method);

@@ -898,6 +898,7 @@ dependencies = [
 name = "lsp_proxy"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-lsp",
  "async-process",
  "clap",
