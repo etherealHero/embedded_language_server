@@ -76,7 +76,23 @@ version = "1.0"
 # other
 [dependencies.clap]
 version = "4.6.1"
-features = ["cargo"]
+features = ["cargo", "derive"]
+
+[dependencies.clap_derive]
+version = "4.6.1"
 
 [dependencies.anyhow]
 version = "1.0.102"
+
+# security
+[dependencies.dotenv]
+version = "0.15.0"
+
+[dependencies.dotenv_codegen]
+version = "0.15.0"
+
+[dependencies.sha2]
+version = "0.11.0"
+
+[dependencies.hex]
+version = "0.4.3"

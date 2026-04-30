@@ -1,3 +1,4 @@
 /target
 .local
 lsp_proxy_output
+.env
