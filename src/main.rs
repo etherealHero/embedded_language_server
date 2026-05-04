@@ -13,6 +13,8 @@ type Pool = Arc<tokio::sync::Mutex<Option<dt::Pool>>>;
 type SymbolRef<'a> = dashmap::mapref::multiple::RefMulti<'a, String, SymbolInfo>;
 type _Notify = F<std::result::Result<(), async_lsp::Error>>;
 
+const APP: &str = env!("CARGO_BIN_NAME");
+
 static RE_IDENT: once_cell::sync::Lazy<regex::Regex> =
     once_cell::sync::Lazy::new(|| regex::Regex::new(r"[\p{L}\p{N}_$]+").unwrap());
 
@@ -102,7 +104,8 @@ impl ServerState {
         } else {
             let path = url.to_file_path();
             let path = path.map_err(|_| anyhow!("url to file path fail"))?;
-            let path = dunce::canonicalize(dunce::simplified(&path))?;
+            let path = dunce::simplified(&path);
+            let path = dunce::canonicalize(path).unwrap_or(path.to_path_buf());
             self.url_to_path.insert(url, path.clone());
             Ok(path)
         }
@@ -158,7 +161,7 @@ impl Server {
 
         info!("resolved config path: {}", root.join(config_path).display());
 
-        let path = root.join(config_path);
+        let path = root.join(config_path); // TODO: add absolute path feature
         let try_exists = path.try_exists()?.eq(&true).then_some(1);
 
         try_exists.ok_or(anyhow!("config file not exists"))?;
@@ -170,8 +173,7 @@ impl Server {
 
         ensure!(
             verify_hash(&config.get_symbols_query, &config.sign),
-            "you should sign config (See: '{} --help')\n{CONFIG_HELP}",
-            clap::crate_name!()
+            "you should sign config (See: '{APP} --help')\n{CONFIG_HELP}",
         );
 
         Ok((path, config))
@@ -280,8 +282,7 @@ impl Server {
         ensure!(self.state.config_path.get().is_some());
 
         let config = self.state.config.try_read()?;
-        let app = clap::crate_name!();
-        let path = format!("{app}_output/{}.{}", config.host, config.database);
+        let path = format!("{APP}_output/{}.{}", config.host, config.database);
         let config_path = self.state.config_path.get().unwrap();
         let output_folder = config_path.parent().unwrap().join(path);
         let symbol_info = &symbol.1;
@@ -379,8 +380,7 @@ impl Server {
         };
 
         let config = self.state.config.try_read()?;
-        let app = clap::crate_name!();
-        let output = format!("{app}_output/{}.{}", config.host, config.database);
+        let output = format!("{APP}_output/{}.{}", config.host, config.database);
         let config_path = self.state.config_path.get().unwrap();
         let output_folder = config_path.parent().unwrap().join(output);
         let case_sensitive = config.case_sensitive.unwrap_or(true);
@@ -459,8 +459,7 @@ impl Server {
     async fn ws_symbol(self, _: lsp::WorkspaceSymbolParams) -> Req<R::WorkspaceSymbolRequest> {
         ensure!(self.state.config_path.get().is_some());
         let config = self.state.config.try_read()?;
-        let app = clap::crate_name!();
-        let path = format!("{app}_output/{}.{}", config.host, config.database);
+        let path = format!("{APP}_output/{}.{}", config.host, config.database);
         let config_path = self.state.config_path.get().unwrap();
         let output_folder = &config_path.parent().unwrap().join(path);
         let map = |s: SymbolRef| {
@@ -526,7 +525,7 @@ impl Server {
     }
 
     async fn initialize(self, p: lsp::InitializeParams) -> Req<R::Initialize> {
-        info!("{} v{}", clap::crate_name!(), clap::crate_version!());
+        info!("{APP} v{}", clap::crate_version!());
 
         debug!("initialization_options `{:#?}`", p.initialization_options);
         debug!(
@@ -550,7 +549,7 @@ impl Server {
                 references_provider: Some(lsp::OneOf::Left(true)),
                 completion_provider: Some(lsp::CompletionOptions::default()),
                 document_symbol_provider: Some(lsp::OneOf::Right(lsp::DocumentSymbolOptions {
-                    label: Some(clap::crate_name!().into()),
+                    label: Some(APP.into()),
                     work_done_progress_options: lsp::WorkDoneProgressOptions::default(),
                 })),
                 workspace_symbol_provider: Some(lsp::OneOf::Right(lsp::WorkspaceSymbolOptions {
@@ -560,10 +559,14 @@ impl Server {
                 ..lsp::ServerCapabilities::default()
             },
             server_info: Some(lsp::ServerInfo {
-                name: clap::crate_name!().to_string(),
+                name: APP.to_string(),
                 version: Some(clap::crate_version!().to_string()),
             }),
         })
+    }
+
+    async fn shutdown(self, _: ()) -> Req<R::Shutdown> {
+        Ok(())
     }
 }
 
@@ -599,6 +602,7 @@ impl Server {
         add_request::<R::Completion, _, _>(&mut router, Server::completion);
         add_request::<R::HoverRequest, _, _>(&mut router, Server::hover);
         add_request::<R::Initialize, _, _>(&mut router, Server::initialize);
+        add_request::<R::Shutdown, _, _>(&mut router, Server::shutdown);
 
         router
             .notification::<N::Initialized>(|_, _| F::Continue(()))
@@ -624,6 +628,7 @@ impl Server {
                     .inspect_err(|e| error!("did close text document error: {e}"))
                     .map_or_else(|e| F::Break(Err(E::other(e).into())), |_| F::Continue(()))
             })
+            .notification::<N::Exit>(|_, _| std::process::exit(0))
             .unhandled_notification(|_, notify| {
                 debug!("unhandled_notification `{}`", notify.method);
                 F::Continue(())
@@ -786,7 +791,6 @@ async fn main() {
             let mut cmd = Cli::command();
             error!("expect 'sign' or 'lsp' option (See --help)");
             cmd.print_help().unwrap();
-            println!();
             std::process::exit(0);
         }
     };
