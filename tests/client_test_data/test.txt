@@ -1,4 +1,0 @@
-- install `mjmorales.generic-lsp-proxy` vscode extension for manual tests
-- press `ctrl+shift+p` then `LSP Proxy: Reload LSP Configuration`
-- press `ctrl+shift+u` then set `Generic LSP Proxy` option for see lsp_proxy output
-- press `ctrl+shift+p` then `LSP Proxy: Restart LSP Server` for rebuild server

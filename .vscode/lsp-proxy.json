@@ -2,10 +2,10 @@
   {
     "languageId": "lsp_proxy",
     "command": "cargo",
-    "args": ["run", "--"],
-    "fileExtensions": [".txt"],
+    "args": ["run", "--", "lsp"],
+    "fileExtensions": [".txt", ".sql", ".md"],
     "initializationOptions": {
-      "configPath": ".vscode/lsp_proxy_config.toml"
+      "configPath": "tests/test_config.toml"
     }
   }
 ]
