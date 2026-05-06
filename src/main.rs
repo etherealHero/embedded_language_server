@@ -308,27 +308,18 @@ impl Server {
                     .match_indices(&symbol_by_case_sensitive)
                     .filter_map(|(byte, _)| {
                         let line_idx = text_document.try_byte_to_line(byte).ok()?;
-                        let line = text_document.get_line(line_idx)?.as_str()?;
                         let line_idx = u32::try_from(line_idx).ok()?;
-                        let line_by_case_sensitive = match case_sensitive {
-                            true => line.to_string(),
-                            false => line.to_lowercase(),
-                        };
-
-                        let offset = line_by_case_sensitive
-                            .match_indices(&symbol_by_case_sensitive)
-                            .find_map(|(offset, _)| {
-                                let offset = u32::try_from(offset).ok()?;
-                                let position = lsp::Position::new(line_idx, offset);
-                                self.get_ident_on_text_document(url.clone(), position)
-                                    .ok()??
-                                    .len()
-                                    .eq(&(symbol_len as usize))
-                                    .then_some(offset)
-                            })?;
-
+                        let line_start_byte = text_document.try_line_to_byte(line_idx as _).ok()?;
+                        let offset = byte.checked_sub(line_start_byte)?;
+                        let offset = u32::try_from(offset).ok()?;
                         let start = lsp::Position::new(line_idx, offset);
                         let end = lsp::Position::new(line_idx, offset + symbol_len);
+
+                        self.get_ident_on_text_document(url.clone(), start)
+                            .ok()??
+                            .len()
+                            .eq(&(symbol_len as usize))
+                            .then_some(())?;
 
                         Some(lsp::DocumentSymbol {
                             name: symbol.clone(),
