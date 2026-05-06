@@ -306,22 +306,15 @@ impl Server {
 
                 text_document_by_case_sensitive
                     .match_indices(&symbol_by_case_sensitive)
-                    .filter_map(|(byte, _)| {
-                        let line_idx = text_document.try_byte_to_line(byte).ok()?;
-                        let line_idx = u32::try_from(line_idx).ok()?;
-                        let line_start_byte = text_document.try_line_to_byte(line_idx as _).ok()?;
-                        let offset = byte.checked_sub(line_start_byte)?;
-                        let offset = u32::try_from(offset).ok()?;
-                        let start = lsp::Position::new(line_idx, offset);
-                        let end = lsp::Position::new(line_idx, offset + symbol_len);
-
-                        self.get_ident_on_text_document(url.clone(), start)
-                            .ok()??
-                            .len()
-                            .eq(&(symbol_len as usize))
-                            .then_some(())?;
-
-                        Some(lsp::DocumentSymbol {
+                    .filter_map(|(b, _)| {
+                        let line = u32::try_from(text_document.try_byte_to_line(b).ok()?).ok()?;
+                        let line_start_byte = text_document.try_line_to_byte(line as _).ok()?;
+                        let offset = u32::try_from(b.checked_sub(line_start_byte)?).ok()?;
+                        let start = lsp::Position::new(line, offset);
+                        let end = lsp::Position::new(line, offset + symbol_len);
+                        let ident = self.get_ident_on_text_document(url.clone(), start).ok()??;
+                        let matched = ident.len().eq(&(symbol_len as usize));
+                        matched.then_some(lsp::DocumentSymbol {
                             name: symbol.clone(),
                             range: lsp::Range::new(start, end),
                             selection_range: lsp::Range::new(start, end),
