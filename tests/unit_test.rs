@@ -246,7 +246,7 @@ async fn config_is_reasigned() {
 async fn request_hover() {
     run_server_with(async |server: &mut ServerSocket, workspace: PathBuf| {
         let file_uri = lsp::Url::from_file_path(workspace.join("some_file.md")).unwrap();
-        let text = "some 'Lorem' identifier";
+        let text = "select top 5 * from vStoreWithDemographics (nolock)";
         let doc = lsp::TextDocumentItem::new(file_uri.clone(), "md".into(), 0, text.into());
 
         server
@@ -256,7 +256,7 @@ async fn request_hover() {
         let params = lsp::HoverParams {
             text_document_position_params: lsp::TextDocumentPositionParams::new(
                 lsp::TextDocumentIdentifier::new(file_uri.clone()),
-                lsp::Position::new(0, text.find("Lorem").unwrap() as _),
+                lsp::Position::new(0, text.find("vStoreWithDemographics").unwrap() as _),
             ),
             work_done_progress_params: lsp::WorkDoneProgressParams::default(),
         };
@@ -267,7 +267,7 @@ async fn request_hover() {
         assert!(matches!(
             hover,
             Ok(Some(lsp::Hover { contents: lsp::HoverContents::Markup(lsp::MarkupContent {value, ..}), .. }))
-                if value.contains("Lorem ipsum dolor est")
+                if value.contains("View: vStoreWithDemographics")
         ));
     })
     .await;
@@ -277,7 +277,7 @@ async fn request_hover() {
 async fn request_definition() {
     run_server_with(async |server: &mut ServerSocket, workspace: PathBuf| {
         let file_uri = lsp::Url::from_file_path(workspace.join("some_file.md")).unwrap();
-        let text = "some 'Lorem' identifier";
+        let text = "vSalesPerson";
         let doc = lsp::TextDocumentItem::new(file_uri.clone(), "md".into(), 0, text.into());
 
         server
@@ -287,7 +287,7 @@ async fn request_definition() {
         let params = lsp::GotoDefinitionParams {
             text_document_position_params: lsp::TextDocumentPositionParams::new(
                 lsp::TextDocumentIdentifier::new(file_uri.clone()),
-                lsp::Position::new(0, text.find("Lorem").unwrap() as _),
+                lsp::Position::new(0, text.find("vSalesPerson").unwrap() as _),
             ),
             work_done_progress_params: lsp::WorkDoneProgressParams::default(),
             partial_result_params: lsp::PartialResultParams::default(),
@@ -313,7 +313,7 @@ async fn request_definition() {
 
         assert!(matches!(
             std::fs::read_to_string(loc.uri.to_file_path().unwrap()),
-            Ok(content) if content == "Lorem Ipsum is a standard dummy text used in printing and web design"
+            Ok(content) if content.contains("CREATE VIEW [Sales].[vSalesPerson]")
         ))
     })
     .await;

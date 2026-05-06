@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::{ops::ControlFlow as F, path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -19,7 +19,7 @@ static RE_IDENT: once_cell::sync::Lazy<regex::Regex> =
     once_cell::sync::Lazy::new(|| regex::Regex::new(r"[\p{L}\p{N}_$]+").unwrap());
 
 static CONFIG_HELP: &str = concat!(
-    "config file should be like:\n",
+    "config TOML file should be like:\n",
     include_str!("../tests/test_config.toml")
 );
 
@@ -56,8 +56,8 @@ impl ServerState {
             let text_document = ropey::Rope::from_str(&changes[0].text.replace("\r\n", "\n"));
             self.text_documents.insert(path, text_document);
         } else {
-            let err = anyhow!("text document not found");
-            let td = &mut self.text_documents.get_mut(&path).ok_or(err)?;
+            let err = "text document not found";
+            let td = &mut self.text_documents.get_mut(&path).context(err)?;
             for change in changes {
                 let r = change.range.as_ref().unwrap();
                 let start = td.line_to_char(r.start.line as usize) + r.start.character as usize;
@@ -73,7 +73,7 @@ impl ServerState {
         self.text_documents
             .get(&self.url_to_path(url)?)
             .map(|text_document| text_document.clone())
-            .ok_or(anyhow!("text document not found"))
+            .context("text document not found")
     }
 
     fn remove_text_document(&self, url: lsp::Url) -> Result<()> {
@@ -98,7 +98,7 @@ impl ServerState {
 impl Server {
     async fn query(&self, query: &str) -> Result<Vec<dt::tiberius::Row>> {
         let pool = self.state.pool.try_lock()?.as_ref().cloned();
-        let pool = pool.ok_or(anyhow!("connection pool not initialized"))?;
+        let pool = pool.context("connection pool not initialized")?;
         let pool_timeouts = dt::deadpool::managed::Timeouts {
             wait: Some(std::time::Duration::from_secs(10)),
             create: Some(std::time::Duration::from_secs(10)),
@@ -108,7 +108,7 @@ impl Server {
         info!("execute query...");
         let mut conn = pool.timeout_get(&pool_timeouts).await?;
         let running_query = async { conn.simple_query(query).await?.into_first_result().await };
-        let timeout_duration = std::time::Duration::from_secs(10);
+        let timeout_duration = std::time::Duration::from_secs(30);
         let Ok(result) = tokio::time::timeout(timeout_duration, running_query).await else {
             dt::deadpool::managed::Object::take(conn).close().await?;
             bail!("execute query timeout")
@@ -120,7 +120,7 @@ impl Server {
     fn parse_config(&self, p: &lsp::InitializeParams) -> Result<(PathBuf, lsp_proxy::Config)> {
         let options = p.initialization_options.as_ref();
         let config_path = options.and_then(|v| v["configPath"].as_str().map(String::from));
-        let config_path = &config_path.ok_or(anyhow!("missing 'configPath' initialize option"))?;
+        let config_path = &config_path.context("missing 'configPath' initialize option")?;
         let resolve_workspace_fail_message = concat!(
             "Resolve workspace folder fail. ",
             "Language Client does not provide any workspace folder options ",
@@ -140,14 +140,14 @@ impl Server {
             .or_else(|| p.root_path.as_ref().map(PathBuf::from))
             .or_else(|| p.root_uri.as_ref().and_then(|url| url.to_file_path().ok()))
             .inspect(|p| info!("resolved Workspace: {}", p.display()))
-            .ok_or(anyhow!(resolve_workspace_fail_message))?;
+            .context(resolve_workspace_fail_message)?;
 
         info!("resolved config path: {}", root.join(config_path).display());
 
         let path = root.join(config_path); // TODO: add absolute path feature
         let try_exists = path.try_exists()?.eq(&true).then_some(1);
 
-        try_exists.ok_or(anyhow!("config file not exists"))?;
+        try_exists.context("config file not exists")?;
         info!("found config: {}", path.display());
 
         let raw_config = std::fs::read(&path).map(|b| String::from_utf8_lossy(&b).into_owned())?;
@@ -188,7 +188,7 @@ impl Server {
 
         for row in self.query(&config.get_symbols_query).await? {
             let ident = row.try_get::<&str, &str>("Identifier")?;
-            let ident = ident.ok_or_else(|| anyhow!("'Identifier' column must be string"))?;
+            let ident = ident.context("'Identifier' column must be string")?;
             let symbol = SymbolInfo {
                 hover: get_prop(&row, "HoverInfo"),
                 definition: get_prop(&row, "DefinitionInfo"),
@@ -207,13 +207,11 @@ impl Server {
     fn get_ident_on_text_document(
         &self,
         url: lsp::Url,
-        position: lsp::Position,
+        p: lsp::Position,
     ) -> Result<Option<String>> {
         let text_document = self.state.get_text_document(url)?;
-        let line_idx = position.line as usize;
-        let line = text_document.get_line(line_idx).map(String::from);
-        let line = line.ok_or(anyhow!("line_idx is out of bounds"))?;
-        Ok(self.get_ident_on_line(&line, position))
+        let line = text_document.get_line(p.line as usize).map(String::from);
+        Ok(self.get_ident_on_line(&line.context("line_idx is out of bounds")?, p))
     }
 
     fn get_ident_on_line(&self, line: &str, position: lsp::Position) -> Option<String> {
@@ -432,8 +430,7 @@ impl Server {
     }
 
     async fn ws_symbol_resolve(self, p: lsp::WorkspaceSymbol) -> Req<R::WorkspaceSymbolResolve> {
-        let get_symbol = self.get_symbol(&p.name)?;
-        let symbol = get_symbol.ok_or_else(|| anyhow!("Expect symbol resolve"))?;
+        let symbol = self.get_symbol(&p.name)?.context("Expect symbol resolve")?;
         let try_emit = self.emit_symbol_definition(symbol);
         try_emit.inspect_err(|e| error!("emit_symbol_definition error: {e}"))?;
         Ok(p)
@@ -658,46 +655,25 @@ fn verify_hash(data: &str, hash: &str) -> bool {
     create_hash(data) == hash
 }
 
-fn sign_config(config_path: &String) {
-    let path = std::fs::exists(config_path).map(|e| e.then(|| PathBuf::from(config_path)));
-    let path = path.unwrap_or_else(|_| {
-        let path = |cwd: PathBuf| cwd.join(config_path);
-        std::env::current_dir().map(path).ok()
-    });
-
-    let Some(Ok(config_path)) = path.map(|p| dunce::canonicalize(dunce::simplified(&p))) else {
-        return eprintln!("config file not found");
-    };
-
-    println!("resolve config: {:?}", config_path);
-
-    let read = std::fs::read(&config_path).map(|b| String::from_utf8_lossy(&b).into_owned());
-    let raw_config = match read {
-        Ok(content) => content,
-        Err(err) => return eprintln!("config file read error: {err}"),
-    };
-
-    let try_parse: std::result::Result<lsp_proxy::Config, _> = toml::from_str(&raw_config);
-    let mut config = match try_parse {
-        Ok(config) => config,
-        Err(err) => {
-            eprintln!("config parse error: {err}");
-            return println!("{}", CONFIG_HELP);
-        }
-    };
-
-    config.sign = create_hash(&config.get_symbols_query);
-
-    let Err(err) = std::fs::write(config_path, toml::to_string(&config).unwrap()) else {
-        return println!("config sign successfull!");
-    };
-
-    eprintln!("config sign error: {err}");
+fn sign_config(config_path: &String) -> Result<()> {
+    let absolute = PathBuf::from(config_path);
+    let absolute_exists = std::fs::exists(&absolute).is_ok_and(|e| e);
+    let relative = std::env::current_dir().map(|cd| cd.join(config_path));
+    let path = absolute_exists.then_some(absolute).or(relative.ok());
+    let path = path.context("config file not found")?;
+    let path = dunce::canonicalize(dunce::simplified(&path)).context("canonicalize path error");
+    let path = path.inspect(|p| println!("resolve config: {:?}", p))?;
+    let raw_config = std::fs::read_to_string(&path).context("config file read error")?;
+    let parse_err = "config parse error. ".to_owned();
+    let config: lsp_proxy::Config = toml::from_str(&raw_config).context(parse_err + CONFIG_HELP)?;
+    let signed_config = raw_config.replace(&config.sign, &create_hash(&config.get_symbols_query));
+    std::fs::write(path, signed_config).context("overwrite config file error")
 }
 
 fn init_registry(debug_level_in_release: bool) {
     use tracing::level_filters::LevelFilter;
 
+    let f = |m: &tracing::Metadata<'_>| m.name() != "service_ready";
     let layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_writer(std::io::stderr)
@@ -709,9 +685,7 @@ fn init_registry(debug_level_in_release: bool) {
             debug_assertions => LevelFilter::DEBUG,
             _ => if debug_level_in_release { LevelFilter::DEBUG } else { LevelFilter::INFO }
         })
-        .with(tracing_subscriber::filter::filter_fn(|m| {
-            m.name() != "service_ready"
-        }))
+        .with(tracing_subscriber::filter::filter_fn(f))
         .with(match debug_level_in_release {
             true => layer.with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE),
             false => layer,
@@ -759,7 +733,9 @@ async fn main() {
             run_service().await;
         }
         Some(Commands::Sign { file }) => {
-            sign_config(&file.to_string_lossy().to_string());
+            let _ = sign_config(&file.to_string_lossy().to_string())
+                .inspect(|_| println!("sign config successfull!"))
+                .inspect_err(|e| eprintln!("sign config fail: {e}"));
         }
         None => {
             let mut cmd = Cli::command();
