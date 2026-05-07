@@ -558,6 +558,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
+name = "embedded_lsp_proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "async-lsp",
+ "async-process",
+ "clap",
+ "clap_derive",
+ "dashmap",
+ "deadpool-tiberius",
+ "dotenv",
+ "dotenv_codegen",
+ "dunce",
+ "futures",
+ "hex",
+ "once_cell",
+ "rayon",
+ "regex",
+ "ropey",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1027,38 +1059,6 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "url",
-]
-
-[[package]]
-name = "lsp_proxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "async-lsp",
- "async-process",
- "clap",
- "clap_derive",
- "dashmap",
- "deadpool-tiberius",
- "dotenv",
- "dotenv_codegen",
- "dunce",
- "futures",
- "hex",
- "once_cell",
- "rayon",
- "regex",
- "ropey",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-util",
- "toml",
- "tower",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
