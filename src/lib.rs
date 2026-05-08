@@ -634,7 +634,8 @@ pub use lsp::OneOf;
 pub async fn run_service(opt: lsp::OneOf<ConfigPath, CacheDir>) -> Result<()> {
     let (config, cache_dir) = match opt {
         lsp::OneOf::Left(config_path) => {
-            let p = resolve_path(&config_path).inspect(|p| info!("config: {}", p.display()))?;
+            let p = resolve_path(&config_path)?;
+            let p = dunce::canonicalize(p).inspect(|p| info!("config: {}", p.display()))?;
             let cache_dir = p.parent().context("extract folder of config path fail")?;
             let cache_dir = cache_dir.join(format!("{CRATE_NAME}_output/{}/", *APP));
             let config = Config::parse(&p)?;
@@ -644,7 +645,7 @@ pub async fn run_service(opt: lsp::OneOf<ConfigPath, CacheDir>) -> Result<()> {
             let config: Config = toml::from_str(include_str!("../tests/sample_config.toml"))?;
             let cache_dir = resolve_path(&cache_dir)?;
             std::fs::create_dir_all(&cache_dir)?;
-            (config, cache_dir)
+            (config, dunce::canonicalize(cache_dir)?)
         }
     };
 

@@ -2,9 +2,11 @@
 
 Embedded language server that provides [LSP](https://microsoft.github.io/language-server-protocol/) features powered by [tiberius](https://github.com/prisma/tiberius) data interface.
 
+![example](https://github.com/etherealHero/embedded_language_server/blob/main/resources/example.png)
+
 ## Usage
 
-Download prebuilt binaries from release page
+<!-- TODO: Download prebuilt binaries from release page -->
 
 ```sh
 $ embedded_language_server --help
