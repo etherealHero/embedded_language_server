@@ -11,15 +11,29 @@ type Pool = Arc<tokio::sync::Mutex<Option<dt::Pool>>>;
 type SymbolRef<'a> = dashmap::mapref::multiple::RefMulti<'a, String, SymbolInfo>;
 type _Notify = F<std::result::Result<(), async_lsp::Error>>;
 
-const APP: &str = clap::crate_name!();
+const CRATE_NAME: &str = clap::crate_name!();
+
+static APP: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
+    let exe = std::env::current_exe().unwrap();
+    exe.file_prefix().unwrap().to_str().unwrap().to_string()
+});
 
 static RE_IDENT: once_cell::sync::Lazy<regex::Regex> =
     once_cell::sync::Lazy::new(|| regex::Regex::new(r"[\p{L}\p{N}_$]+").unwrap());
 
 pub static CONFIG_HELP: &str = concat!(
     "config TOML file should be like:\n",
-    include_str!("../tests/test_config.toml")
+    include_str!("../tests/sample_config.toml")
 );
+
+/// resolve absolute path of [`raw_path`] (supports file or directory path)
+pub fn resolve_path(raw_path: &PathBuf) -> Result<std::path::PathBuf> {
+    let absolute_exists = std::fs::exists(raw_path).is_ok_and(|e| e);
+    let relative = std::env::current_dir().map(|cd| cd.join(raw_path));
+    let path = absolute_exists.then_some(raw_path.into()).or(relative.ok());
+    let path = path.context(format!("{raw_path:?} not found"))?;
+    Ok(dunce::simplified(&path).to_path_buf())
+}
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Default, Clone)]
 pub struct Config {
@@ -31,15 +45,6 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn find(raw_path: &String) -> Result<std::path::PathBuf> {
-        let absolute = std::path::PathBuf::from(raw_path);
-        let absolute_exists = std::fs::exists(&absolute).is_ok_and(|e| e);
-        let relative = std::env::current_dir().map(|cd| cd.join(raw_path));
-        let path = absolute_exists.then_some(absolute).or(relative.ok());
-        let path = path.context("config file not found")?;
-        dunce::canonicalize(dunce::simplified(&path)).context("canonicalize path error")
-    }
-
     pub fn parse(config_path: &std::path::PathBuf) -> Result<Self> {
         let raw_config = std::fs::read_to_string(config_path).context("config file read error")?;
         toml::from_str(&raw_config).context("config parse error. ".to_owned() + CONFIG_HELP)
@@ -53,8 +58,8 @@ impl Config {
         hex::encode(hasher.finalize())
     }
 
-    pub fn sign(raw_path: &String) -> Result<()> {
-        let path = Self::find(raw_path)?;
+    pub fn sign(raw_path: &PathBuf) -> Result<()> {
+        let path = resolve_path(raw_path)?;
         let raw_config = std::fs::read_to_string(&path).context("config file read error")?;
         let config = Self::parse(&path)?;
         let signed_config = raw_config.replace(&config.sign, &config.sign_key());
@@ -72,12 +77,12 @@ struct SymbolInfo {
 #[derive(Default)]
 struct ServerState {
     pool: Pool,
-    config: tokio::sync::RwLock<Config>,
-    config_path: std::sync::OnceLock<PathBuf>,
-    _client: std::sync::OnceLock<async_lsp::ClientSocket>,
+    config: Config,
+    cache_dir: PathBuf,
     symbols: dashmap::DashMap<String, SymbolInfo>,
     url_to_path: dashmap::DashMap<lsp::Url, PathBuf>,
     text_documents: dashmap::DashMap<PathBuf, ropey::Rope>,
+    _client: Option<async_lsp::ClientSocket>,
 }
 
 struct Server {
@@ -157,11 +162,12 @@ impl Server {
     }
 
     async fn startup(&self) -> Result<()> {
-        let config = Config::parse(self.state.config_path.get().unwrap())?;
+        let config = &self.state.config;
 
         ensure!(
             config.sign_key() == config.sign,
-            "you should sign config (See: '{APP} --help')\n{CONFIG_HELP}"
+            "you should sign config (See: '{} --help')\n{CONFIG_HELP}",
+            *APP
         );
 
         let manager = match config.trust_cert.is_some_and(|t| t) {
@@ -196,9 +202,6 @@ impl Server {
             self.state.symbols.insert(ident.into(), symbol);
         }
 
-        let mut uninit_config = self.state.config.write().await;
-        *uninit_config = config;
-
         Ok(())
     }
 
@@ -231,48 +234,36 @@ impl Server {
         position: lsp::Position,
     ) -> Result<Option<(String, SymbolInfo)>> {
         self.get_ident_on_text_document(url, position)?
-            .map(|ident| self.get_symbol(&ident))
+            .map(|ident| Ok(self.get_symbol(&ident)))
             .unwrap_or(Ok(None))
     }
 
-    fn get_symbol(&self, ident: &str) -> Result<Option<(String, SymbolInfo)>> {
-        let symbol_pair = if self.state.config.try_read()?.case_sensitive.unwrap_or(true) {
-            self.state
-                .symbols
-                .get(ident)
-                .map(|s| (s.key().clone(), s.value().clone()))
+    fn get_symbol(&self, ident: &str) -> Option<(String, SymbolInfo)> {
+        let trace = || debug!("symbol by ident `{ident}` not found");
+        let symbol_pair = if self.state.config.case_sensitive.unwrap_or(true) {
+            let symbol = self.state.symbols.get(ident);
+            symbol.map(|s| (s.key().clone(), s.value().clone()))
         } else {
             let ident = ident.to_lowercase();
             self.state.symbols.par_iter().find_map_first(|s| {
-                s.key()
-                    .to_lowercase()
-                    .eq(&ident)
-                    .then_some((s.key().clone(), s.value().clone()))
+                let matched = s.key().to_lowercase().eq(&ident);
+                matched.then_some((s.key().clone(), s.value().clone()))
             })
         };
-
-        if symbol_pair.is_some() {
-            Ok(symbol_pair)
-        } else {
-            warn!("symbol by ident `{ident}` not found");
-            Ok(None)
-        }
+        symbol_pair.is_none().then(trace);
+        symbol_pair
     }
 
     fn emit_symbol_definition(&self, symbol: (String, SymbolInfo)) -> Result<lsp::Url> {
-        ensure!(self.state.config_path.get().is_some());
-
-        let config_path = self.state.config_path.get().unwrap();
-        let output_folder = config_path.parent().unwrap().join(format!("{APP}_output/"));
-        let symbol_info = &symbol.1;
-
-        if !std::fs::exists(&output_folder)? {
-            std::fs::create_dir_all(&output_folder)?
+        if !std::fs::exists(&self.state.cache_dir)? {
+            std::fs::create_dir_all(&self.state.cache_dir)?
         };
 
+        let symbol_info = &symbol.1;
         ensure!(symbol_info.definition_file_ext.is_some() & symbol_info.definition.is_some());
 
-        let file = output_folder.join(symbol.0.to_owned() + &symbol.1.definition_file_ext.unwrap());
+        let name = symbol.0.to_owned() + &symbol.1.definition_file_ext.unwrap();
+        let file = self.state.cache_dir.join(name);
 
         std::fs::write(&file, symbol.1.definition.unwrap())?;
         Ok(lsp::Url::from_file_path(file).unwrap())
@@ -283,7 +274,7 @@ impl Server {
 impl Server {
     async fn document_symbol(self, p: lsp::DocumentSymbolParams) -> Req<R::DocumentSymbolRequest> {
         let url = p.text_document.uri;
-        let case_sensitive = self.state.config.try_read()?.case_sensitive.unwrap_or(true);
+        let case_sensitive = self.state.config.case_sensitive.unwrap_or(true);
         let text_document = self.state.get_text_document(url.clone())?;
         let text_document_by_case_sensitive = match case_sensitive {
             true => text_document.to_string(),
@@ -334,19 +325,13 @@ impl Server {
     }
 
     async fn references(self, p: lsp::ReferenceParams) -> Req<R::References> {
-        ensure!(self.state.config_path.get().is_some());
-
         let url = p.text_document_position.text_document.uri;
         let position = p.text_document_position.position;
         let Some((symbol_to_search, _)) = self.get_symbol_on_text_document(url, position)? else {
             return Ok(None);
         };
 
-        let config = self.state.config.try_read()?;
-        let output = format!("{APP}_output/",);
-        let config_path = self.state.config_path.get().unwrap();
-        let output_folder = config_path.parent().unwrap().join(output);
-        let case_sensitive = config.case_sensitive.unwrap_or(true);
+        let case_sensitive = self.state.config.case_sensitive.unwrap_or(true);
         let symbol_to_search_len = symbol_to_search.len() as u32;
         let symbol_to_search = &match case_sensitive {
             true => symbol_to_search,
@@ -360,7 +345,7 @@ impl Server {
             .filter_map(|symbol| {
                 let ext = symbol.definition_file_ext.clone()?;
                 let filename = symbol.key().to_owned() + &ext;
-                let uri = lsp::Url::from_file_path(output_folder.join(filename)).ok()?;
+                let uri = lsp::Url::from_file_path(self.state.cache_dir.join(filename)).ok()?;
                 let definition_by_case_sensitive = match case_sensitive {
                     true => symbol.definition.clone()?,
                     false => symbol.definition.clone()?.to_lowercase(),
@@ -412,19 +397,17 @@ impl Server {
     }
 
     async fn ws_symbol_resolve(self, p: lsp::WorkspaceSymbol) -> Req<R::WorkspaceSymbolResolve> {
-        let symbol = self.get_symbol(&p.name)?.context("Expect symbol resolve")?;
+        let symbol = self.get_symbol(&p.name).context("Expect symbol resolve")?;
         let try_emit = self.emit_symbol_definition(symbol);
         try_emit.inspect_err(|e| error!("emit_symbol_definition error: {e}"))?;
         Ok(p)
     }
 
     async fn ws_symbol(self, _: lsp::WorkspaceSymbolParams) -> Req<R::WorkspaceSymbolRequest> {
-        ensure!(self.state.config_path.get().is_some());
-        let config_path = self.state.config_path.get().unwrap();
-        let output_folder = &config_path.parent().unwrap().join(format!("{APP}_output"));
         let map = |s: SymbolRef| {
             let ext = s.definition_file_ext.as_ref()?;
-            let uri = lsp::Url::from_file_path(output_folder.join(s.key().clone() + ext)).ok()?;
+            let path = self.state.cache_dir.join(s.key().clone() + ext);
+            let uri = lsp::Url::from_file_path(path).ok()?;
             Some(lsp::WorkspaceSymbol {
                 location: lsp::OneOf::Right(lsp::WorkspaceLocation { uri }),
                 kind: lsp::SymbolKind::VARIABLE,
@@ -485,7 +468,7 @@ impl Server {
     }
 
     async fn initialize(self, p: lsp::InitializeParams) -> Req<R::Initialize> {
-        info!("{APP} v{}", clap::crate_version!());
+        info!("{CRATE_NAME} v{}", clap::crate_version!());
         debug!("initialization_options `{:#?}`", p.initialization_options);
 
         let try_startup = self.startup().await;
@@ -501,7 +484,7 @@ impl Server {
                 references_provider: Some(lsp::OneOf::Left(true)),
                 completion_provider: Some(lsp::CompletionOptions::default()),
                 document_symbol_provider: Some(lsp::OneOf::Right(lsp::DocumentSymbolOptions {
-                    label: Some(APP.into()),
+                    label: Some(APP.to_string()),
                     work_done_progress_options: lsp::WorkDoneProgressOptions::default(),
                 })),
                 workspace_symbol_provider: Some(lsp::OneOf::Right(lsp::WorkspaceSymbolOptions {
@@ -525,13 +508,15 @@ impl Server {
 impl Server {
     fn create(
         client: async_lsp::ClientSocket,
-        config_path: PathBuf,
+        config: Config,
+        cache_dir: PathBuf,
     ) -> async_lsp::router::Router<Arc<ServerState>> {
         use std::io::Error as E;
 
         let mut router = async_lsp::router::Router::new(Arc::new(ServerState {
+            config,
+            cache_dir,
             _client: client.into(),
-            config_path: config_path.into(),
             ..ServerState::default()
         }));
 
@@ -601,11 +586,67 @@ impl Server {
     }
 }
 
-pub async fn run_service(raw_config_path: &String) {
-    let config_path = Config::find(raw_config_path)
-        .inspect(|p| info!("resolved config: {}", p.display()))
-        .inspect_err(|e| error!("resolve config fail: {e}"))
-        .expect("valid config path");
+pub fn init_registry(debug_level_in_release: bool) {
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    let f = |m: &tracing::Metadata<'_>| m.name() != "service_ready";
+    let layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_target(cfg!(debug_assertions) | debug_level_in_release)
+        .with_writer(std::io::stderr)
+        .with_line_number(cfg!(debug_assertions) | debug_level_in_release)
+        .with_file(cfg!(debug_assertions));
+
+    tracing_subscriber::registry()
+        .with(cfg_select! {
+            debug_assertions => LevelFilter::DEBUG,
+            _ => if debug_level_in_release { LevelFilter::DEBUG } else { LevelFilter::INFO }
+        })
+        .with(tracing_subscriber::filter::filter_fn(f))
+        .with(match debug_level_in_release {
+            true => layer.with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE),
+            false => layer,
+        })
+        .init();
+}
+
+#[derive(clap::Parser, Debug)]
+#[command(long_about = None)]
+pub struct Cli<T: clap::Subcommand> {
+    /// Enable debug level logging
+    #[arg(long, global = true)]
+    pub debug: bool,
+
+    /// VSCode provides this flag by default, we ignore it
+    #[arg(long, hide = true, global = true)]
+    stdio: bool,
+
+    /// Subcommands to run specific modes
+    #[command(subcommand)]
+    pub command: Option<T>,
+}
+
+type ConfigPath = PathBuf;
+type CacheDir = PathBuf;
+pub use lsp::OneOf;
+
+pub async fn run_service(opt: lsp::OneOf<ConfigPath, CacheDir>) -> Result<()> {
+    let (config, cache_dir) = match opt {
+        lsp::OneOf::Left(config_path) => {
+            let p = resolve_path(&config_path).inspect(|p| info!("config: {}", p.display()))?;
+            let cache_dir = p.parent().context("extract folder of config path fail")?;
+            let cache_dir = cache_dir.join(format!("{CRATE_NAME}_output/{}/", *APP));
+            let config = Config::parse(&p)?;
+            (config, cache_dir)
+        }
+        lsp::OneOf::Right(cache_dir) => {
+            let config: Config = toml::from_str(include_str!("../tests/sample_config.toml"))?;
+            let cache_dir = resolve_path(&cache_dir)?;
+            std::fs::create_dir_all(&cache_dir)?;
+            (config, cache_dir)
+        }
+    };
 
     info!("start service...");
 
@@ -617,7 +658,7 @@ pub async fn run_service(raw_config_path: &String) {
             .layer(async_lsp::panic::CatchUnwindLayer::default())
             .layer(async_lsp::concurrency::ConcurrencyLayer::default())
             .layer(ClientProcessMonitorLayer::new(client.clone()))
-            .service(Server::create(client, config_path))
+            .service(Server::create(client, config, cache_dir))
     });
 
     let (stdin, stdout) = cfg_select! {
@@ -632,5 +673,6 @@ pub async fn run_service(raw_config_path: &String) {
     };
 
     info!("service is running");
-    server.run_buffered(stdin, stdout).await.unwrap();
+    let service = server.run_buffered(stdin, stdout);
+    service.await.context("server process fail")
 }

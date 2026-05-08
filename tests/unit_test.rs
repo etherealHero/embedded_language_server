@@ -1,10 +1,10 @@
-use embedded_lsp_proxy::Config;
+use embedded_language_server::Config;
 
 use async_lsp::LanguageServer;
 use async_lsp::lsp_types::{self as lsp};
 use tracing::debug;
 
-const APP_PATH: &str = env!("CARGO_BIN_EXE_embedded_lsp_proxy");
+const APP_PATH: &str = env!("CARGO_BIN_EXE_embedded_language_server");
 const TMPDIR: &str = env!("CARGO_TARGET_TMPDIR");
 
 type MainLoop = async_lsp::MainLoop<
@@ -35,7 +35,7 @@ async fn config_is_unsigned() -> anyhow::Result<()> {
     init_tracing();
 
     let config_path = std::path::PathBuf::from(TMPDIR).join("unsigned.toml");
-    let raw_config = include_str!("test_config.toml");
+    let raw_config = include_str!("sample_config.toml");
     let mut config: Config = toml::from_str(raw_config)?;
 
     config.get_symbols_query += "--brake sign";
@@ -70,7 +70,7 @@ async fn config_is_reasigned() -> anyhow::Result<()> {
     init_tracing();
 
     let config_path = std::path::PathBuf::from(TMPDIR).join("reasigned.toml");
-    let raw_config = include_str!("test_config.toml");
+    let raw_config = include_str!("sample_config.toml");
     let mut config: Config = toml::from_str(raw_config)?;
 
     config.get_symbols_query += "--brake sign";
@@ -104,7 +104,7 @@ async fn request_hover() -> anyhow::Result<()> {
     let root_dir = std::path::Path::new(TMPDIR).canonicalize()?;
     let config_path = root_dir.join("temp_config.toml");
 
-    std::fs::write(&config_path, include_str!("test_config.toml"))?;
+    std::fs::write(&config_path, include_str!("sample_config.toml"))?;
 
     let (mut client, mainloop, service) = spawn(["lsp", config_path.to_str().unwrap()]);
     let mainloop_fut = tokio::spawn(async move {
@@ -151,7 +151,7 @@ async fn request_definition() -> anyhow::Result<()> {
     let root_dir = std::path::Path::new(TMPDIR).canonicalize()?;
     let config_path = root_dir.join("temp_config.toml");
 
-    std::fs::write(&config_path, include_str!("test_config.toml"))?;
+    std::fs::write(&config_path, include_str!("sample_config.toml"))?;
 
     let (mut client, mainloop, service) = spawn(["lsp", config_path.to_str().unwrap()]);
     let mainloop_fut = tokio::spawn(async move {
