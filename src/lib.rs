@@ -26,6 +26,31 @@ pub static CONFIG_HELP: &str = concat!(
     include_str!("../tests/sample_config.toml")
 );
 
+fn utf16_offset_to_utf8(s: &str, utf16_offset: usize) -> Option<usize> {
+    let mut utf16_count = 0;
+    for (utf8_offset, ch) in s.char_indices() {
+        if utf16_count >= utf16_offset {
+            return Some(utf8_offset);
+        }
+        utf16_count += ch.len_utf16();
+    }
+    Some(s.len())
+}
+
+fn utf8_offset_to_utf16(s: &str, utf8_offset: usize) -> Option<usize> {
+    if utf8_offset > s.len() {
+        return None;
+    }
+    let mut utf16_offset = 0;
+    for (byte_idx, ch) in s.char_indices() {
+        if byte_idx >= utf8_offset {
+            break;
+        }
+        utf16_offset += ch.len_utf16();
+    }
+    Some(utf16_offset)
+}
+
 /// resolve absolute path of [`raw_path`] (supports file or directory path)
 pub fn resolve_path(raw_path: &PathBuf) -> Result<std::path::PathBuf> {
     let absolute_exists = std::fs::exists(raw_path).is_ok_and(|e| e);
@@ -216,7 +241,7 @@ impl Server {
     }
 
     fn get_ident_on_line(&self, line: &str, position: lsp::Position) -> Option<String> {
-        let offset = position.character as usize;
+        let offset = utf16_offset_to_utf8(line, position.character as usize)?;
         if offset > line.len() {
             None
         } else {
@@ -296,11 +321,15 @@ impl Server {
                 text_document_by_case_sensitive
                     .match_indices(&symbol_by_case_sensitive)
                     .filter_map(|(b, _)| {
-                        let line = u32::try_from(text_document.try_byte_to_line(b).ok()?).ok()?;
-                        let line_start_byte = text_document.try_line_to_byte(line as _).ok()?;
+                        let line_idx = text_document.try_byte_to_line(b).ok()?;
+                        let line = text_document.get_line(line_idx).map(String::from)?;
+                        let line_idx = u32::try_from(line_idx).ok()?;
+                        let line_start_byte = text_document.try_line_to_byte(line_idx as _).ok()?;
                         let offset = u32::try_from(b.checked_sub(line_start_byte)?).ok()?;
-                        let start = lsp::Position::new(line, offset);
-                        let end = lsp::Position::new(line, offset + symbol_len);
+                        let offset = utf8_offset_to_utf16(&line, offset as _)?;
+                        let offset = u32::try_from(offset).ok()?;
+                        let start = lsp::Position::new(line_idx, offset);
+                        let end = lsp::Position::new(line_idx, offset + symbol_len);
                         let ident = self.get_ident_on_text_document(url.clone(), start).ok()??;
                         let matched = ident.len().eq(&(symbol_len as usize));
                         matched.then_some(lsp::DocumentSymbol {
@@ -360,7 +389,10 @@ impl Server {
                         let line_idx = u32::try_from(line_idx).ok()?;
                         let line_ranges: Vec<_> = line
                             .match_indices(symbol_to_search)
-                            .map(|(offset, _)| lsp::Position::new(line_idx, offset as u32))
+                            .filter_map(|(offset, _)| {
+                                let c = u32::try_from(utf8_offset_to_utf16(line, offset)?).ok()?;
+                                Some(lsp::Position::new(line_idx, c))
+                            })
                             .filter_map(|start| {
                                 let character = start.character + symbol_to_search_len;
                                 let end = lsp::Position::new(line_idx, character);
