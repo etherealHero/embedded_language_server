@@ -67,6 +67,8 @@ pub struct Config {
     pub case_sensitive: Option<bool>,
     pub get_symbols_query: String,
     pub sign: String,
+
+    symbols_highlight: Option<bool>,
 }
 
 impl Config {
@@ -104,6 +106,8 @@ struct ServerState {
     pool: Pool,
     config: Config,
     cache_dir: PathBuf,
+    token_types: std::sync::OnceLock<Vec<lsp::SemanticTokenType>>,
+    token_type_highlight_idx: std::sync::OnceLock<u32>,
     symbols: dashmap::DashMap<String, SymbolInfo>,
     url_to_path: dashmap::DashMap<lsp::Url, PathBuf>,
     text_documents: dashmap::DashMap<PathBuf, ropey::Rope>,
@@ -186,7 +190,26 @@ impl Server {
         Ok(result.inspect(|r| info!("execute query success: {} rows selected", r.len()))?)
     }
 
-    async fn startup(&self) -> Result<()> {
+    async fn startup(&self, p: lsp::InitializeParams) -> Result<()> {
+        let cap = p.capabilities.text_document.as_ref();
+        let st_cap = cap.and_then(|c| c.semantic_tokens.as_ref());
+        let tt = st_cap.map(|c| c.token_types.clone()).unwrap_or_default();
+        let mut enumerate = tt.iter().enumerate();
+        let typ = lsp::SemanticTokenType::ENUM_MEMBER; // soft hl
+        let idx = enumerate.find_map(|(idx, t)| t.eq(&typ).then_some(u32::try_from(idx).ok()));
+        if let Some(idx) = idx.flatten() {
+            let hl_idx = self.state.token_type_highlight_idx.set(idx);
+            hl_idx.map_err(|_| anyhow!("token_type_highlight_idx already set"))?;
+        } else {
+            warn!("{typ:?} not found at client token_types capabilities");
+        };
+
+        debug!("token_types: `{tt:?}`");
+        self.state
+            .token_types
+            .set(tt)
+            .map_err(|_| anyhow!("token types already set"))?;
+
         let config = &self.state.config;
 
         ensure!(
@@ -297,6 +320,69 @@ impl Server {
 
 /// [`lsp`] implementation
 impl Server {
+    async fn semantic_tokens(self, p: lsp::TextDocumentIdentifier) -> Result<lsp::SemanticTokens> {
+        let Some(hl_idx) = self.state.token_type_highlight_idx.get().cloned() else {
+            debug!("token_type_highlight_idx not set");
+            let (result_id, data) = (None, vec![]);
+            let semantic_tokens = lsp::SemanticTokens { result_id, data };
+            return Ok(semantic_tokens);
+        };
+        let tokens = self
+            .document_symbol(lsp::DocumentSymbolParams {
+                text_document: p,
+                work_done_progress_params: lsp::WorkDoneProgressParams::default(),
+                partial_result_params: lsp::PartialResultParams::default(),
+            })
+            .await?
+            .map(|res| {
+                let mut symbols = match res {
+                    lsp::DocumentSymbolResponse::Nested(s) => s,
+                    _ => unreachable!(),
+                };
+                symbols.sort_by_key(|s| s.range.start);
+                let mut data = Vec::with_capacity(symbols.len());
+                let (mut prev_line, mut prev_char) = (0u32, 0u32);
+                for s in symbols {
+                    let start = &s.range.start;
+                    let end_character = s.range.end.character;
+                    let delta_line = start.line - prev_line;
+                    let delta_start = match delta_line == 0 {
+                        true => start.character - prev_char,
+                        false => start.character,
+                    };
+                    let length = end_character - start.character;
+                    data.push(lsp::SemanticToken {
+                        delta_line,
+                        delta_start,
+                        length,
+                        token_type: hl_idx,
+                        token_modifiers_bitset: 0,
+                    });
+                    prev_line = start.line;
+                    prev_char = start.character;
+                }
+                let result_id = None;
+                lsp::SemanticTokens { result_id, data }
+            });
+        Ok(tokens.unwrap_or_default())
+    }
+
+    async fn semantic_tokens_range(
+        self,
+        p: lsp::SemanticTokensRangeParams,
+    ) -> Req<R::SemanticTokensRangeRequest> {
+        let tokens = self.semantic_tokens(p.text_document).await?;
+        Ok(Some(lsp::SemanticTokensRangeResult::Tokens(tokens)))
+    }
+
+    async fn semantic_tokens_full(
+        self,
+        p: lsp::SemanticTokensParams,
+    ) -> Req<R::SemanticTokensFullRequest> {
+        let tokens = self.semantic_tokens(p.text_document).await?;
+        Ok(Some(lsp::SemanticTokensResult::Tokens(tokens)))
+    }
+
     async fn document_symbol(self, p: lsp::DocumentSymbolParams) -> Req<R::DocumentSymbolRequest> {
         let url = p.text_document.uri;
         let case_sensitive = self.state.config.case_sensitive.unwrap_or(true);
@@ -503,8 +589,10 @@ impl Server {
         info!("{CRATE_NAME} v{}", clap::crate_version!());
         debug!("initialization_options `{:#?}`", p.initialization_options);
 
-        let try_startup = self.startup().await;
+        let try_startup = self.startup(p).await;
         try_startup.inspect_err(|e| error!("startup fail: {e}"))?;
+
+        let symbols_highlight = self.state.config.symbols_highlight;
 
         Ok(lsp::InitializeResult {
             capabilities: lsp::ServerCapabilities {
@@ -523,6 +611,20 @@ impl Server {
                     resolve_provider: Some(true),
                     work_done_progress_options: lsp::WorkDoneProgressOptions::default(),
                 })),
+                semantic_tokens_provider: symbols_highlight.is_some_and(|enable| enable).then_some(
+                    lsp::SemanticTokensServerCapabilities::SemanticTokensOptions({
+                        let token_types = self.state.token_types.get().cloned().unwrap_or_default();
+                        lsp::SemanticTokensOptions {
+                            legend: lsp::SemanticTokensLegend {
+                                token_types,
+                                token_modifiers: vec![],
+                            },
+                            full: Some(lsp::SemanticTokensFullOptions::Bool(true)),
+                            range: Some(true),
+                            ..Default::default()
+                        }
+                    }),
+                ),
                 ..lsp::ServerCapabilities::default()
             },
             server_info: Some(lsp::ServerInfo {
@@ -567,6 +669,10 @@ impl Server {
             })
         }
 
+        let stf = Server::semantic_tokens_full;
+        let str = Server::semantic_tokens_range;
+        add_request::<R::SemanticTokensFullRequest, _, _>(&mut router, stf);
+        add_request::<R::SemanticTokensRangeRequest, _, _>(&mut router, str);
         add_request::<R::DocumentSymbolRequest, _, _>(&mut router, Server::document_symbol);
         add_request::<R::References, _, _>(&mut router, Server::references);
         add_request::<R::WorkspaceSymbolResolve, _, _>(&mut router, Server::ws_symbol_resolve);
