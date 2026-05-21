@@ -565,17 +565,16 @@ impl Server {
             })
             .collect::<Vec<_>>();
 
-        symbols.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        symbols.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
         symbols.truncate(100);
 
         let client_resolve_support = self
             .state
             .client_capabilities
-            .get_or_init(|| lsp::ClientCapabilities::default())
+            .get_or_init(lsp::ClientCapabilities::default)
             .workspace
             .as_ref()
-            .map(|w| w.symbol.as_ref().map(|s| s.resolve_support.is_some()))
-            .flatten()
+            .and_then(|w| w.symbol.as_ref().map(|s| s.resolve_support.is_some()))
             .unwrap_or_default();
 
         if !client_resolve_support {
