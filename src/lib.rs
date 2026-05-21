@@ -761,15 +761,31 @@ impl Server {
     }
 }
 
+static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
+    std::sync::OnceLock::new();
+
 pub fn init_registry(debug_level_in_release: bool) {
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+    let _log_file = if cfg!(debug_assertions) {
+        let file_appender = tracing_appender::rolling::never(".", "lsp.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        LOG_GUARD.set(guard).ok();
+        Some(non_blocking)
+    } else {
+        None
+    };
+
     let f = |m: &tracing::Metadata<'_>| m.name() != "service_ready";
     let layer = tracing_subscriber::fmt::layer()
+        .without_time()
         .with_ansi(false)
         .with_target(cfg!(debug_assertions) | debug_level_in_release)
-        .with_writer(std::io::stderr)
+        .with_writer(cfg_select! {
+            debug_assertions => _log_file.unwrap(),
+            _ => std::io::stderr
+        })
         .with_line_number(cfg!(debug_assertions) | debug_level_in_release)
         .with_file(cfg!(debug_assertions));
 
