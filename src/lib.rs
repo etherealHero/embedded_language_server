@@ -520,7 +520,6 @@ impl Server {
     }
 
     async fn ws_symbol(self, p: lsp::WorkspaceSymbolParams) -> Req<R::WorkspaceSymbolRequest> {
-        // TODO:
         let query = p.query.trim();
         if query.is_empty() {
             return Ok(None);
@@ -568,6 +567,24 @@ impl Server {
 
         symbols.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         symbols.truncate(100);
+
+        let client_resolve_support = self
+            .state
+            .client_capabilities
+            .get_or_init(|| lsp::ClientCapabilities::default())
+            .workspace
+            .as_ref()
+            .map(|w| w.symbol.as_ref().map(|s| s.resolve_support.is_some()))
+            .flatten()
+            .unwrap_or_default();
+
+        if !client_resolve_support {
+            symbols.par_iter().for_each(|(_, s)| {
+                if !std::fs::exists(self.state.cache_dir.join(&s.name)).is_ok_and(|e| e) {
+                    let _ = self.emit_symbol_definition(self.get_symbol(&s.name).unwrap());
+                };
+            });
+        }
 
         let symbols = symbols.into_iter().map(|(_, s)| s).collect();
 
