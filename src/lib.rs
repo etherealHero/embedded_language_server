@@ -539,9 +539,9 @@ impl Server {
             .filter_map(|s| {
                 let haystack = nucleo_matcher::Utf32Str::new(s.key(), &mut buf);
                 let score = pattern.score(haystack, matcher)?;
-            let ext = s.definition_file_ext.as_ref()?;
-            let path = self.state.cache_dir.join(s.key().clone() + ext);
-            let uri = lsp::Url::from_file_path(path).ok()?;
+                let ext = s.definition_file_ext.as_ref()?;
+                let path = self.state.cache_dir.join(s.key().clone() + ext);
+                let uri = lsp::Url::from_file_path(path).ok()?;
                 let last_line_idx = s.definition.as_ref()?.lines().count().saturating_sub(1);
                 let last_line_idx = u32::try_from(last_line_idx).unwrap_or(u32::MAX);
                 let end = lsp::Position::new(last_line_idx, 0);
@@ -553,10 +553,10 @@ impl Server {
                     },
                     lsp::SymbolInformation {
                         name: s.key().clone(),
-                kind: lsp::SymbolKind::VARIABLE,
+                        kind: lsp::SymbolKind::VARIABLE,
                         tags: None,
                         location: lsp::Location::new(uri, range),
-                container_name: None,
+                        container_name: None,
                         #[allow(deprecated)]
                         deprecated: None,
                     },
