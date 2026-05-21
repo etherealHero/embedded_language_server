@@ -106,12 +106,13 @@ struct ServerState {
     pool: Pool,
     config: Config,
     cache_dir: PathBuf,
-    token_types: std::sync::OnceLock<Vec<lsp::SemanticTokenType>>,
-    token_type_highlight_idx: std::sync::OnceLock<u32>,
     symbols: dashmap::DashMap<String, SymbolInfo>,
     url_to_path: dashmap::DashMap<lsp::Url, PathBuf>,
     text_documents: dashmap::DashMap<PathBuf, ropey::Rope>,
+
     _client: Option<async_lsp::ClientSocket>,
+    client_capabilities: std::sync::OnceLock<lsp::ClientCapabilities>,
+    token_type_highlight_idx: std::sync::OnceLock<u32>,
 }
 
 struct Server {
@@ -197,19 +198,6 @@ impl Server {
         let mut enumerate = tt.iter().enumerate();
         let typ = lsp::SemanticTokenType::ENUM_MEMBER; // soft hl
         let idx = enumerate.find_map(|(idx, t)| t.eq(&typ).then_some(u32::try_from(idx).ok()));
-        if let Some(idx) = idx.flatten() {
-            let hl_idx = self.state.token_type_highlight_idx.set(idx);
-            hl_idx.map_err(|_| anyhow!("token_type_highlight_idx already set"))?;
-        } else {
-            warn!("{typ:?} not found at client token_types capabilities");
-        };
-
-        debug!("token_types: `{tt:?}`");
-        self.state
-            .token_types
-            .set(tt)
-            .map_err(|_| anyhow!("token types already set"))?;
-
         let config = &self.state.config;
 
         ensure!(
@@ -217,6 +205,14 @@ impl Server {
             "you should sign config (See: '{} --help')\n{CONFIG_HELP}",
             *APP
         );
+
+        debug!("token_types: `{tt:?}`");
+        self.state.client_capabilities.set(p.capabilities).unwrap();
+
+        match idx.flatten() {
+            Some(idx) => self.state.token_type_highlight_idx.set(idx).unwrap(),
+            None => warn!("{typ:?} not found at client token_types capabilities"),
+        };
 
         let manager = match config.trust_cert.is_some_and(|t| t) {
             true => dt::Manager::from_ado_string(&config.ado_connection_string)?.trust_cert(),
@@ -521,22 +517,59 @@ impl Server {
         Ok(p)
     }
 
-    async fn ws_symbol(self, _: lsp::WorkspaceSymbolParams) -> Req<R::WorkspaceSymbolRequest> {
-        let map = |s: SymbolRef| {
+    async fn ws_symbol(self, p: lsp::WorkspaceSymbolParams) -> Req<R::WorkspaceSymbolRequest> {
+        // TODO:
+        let query = p.query.trim();
+        if query.is_empty() {
+            return Ok(None);
+        }
+
+        let matcher = &mut nucleo_matcher::Matcher::default();
+        let pattern = nucleo_matcher::pattern::Pattern::parse(
+            query,
+            nucleo_matcher::pattern::CaseMatching::Smart,
+            nucleo_matcher::pattern::Normalization::Smart,
+        );
+
+        let mut buf = vec![];
+        let mut symbols = self
+            .state
+            .symbols
+            .iter()
+            .filter_map(|s| {
+                let haystack = nucleo_matcher::Utf32Str::new(s.key(), &mut buf);
+                let score = pattern.score(haystack, matcher)?;
             let ext = s.definition_file_ext.as_ref()?;
             let path = self.state.cache_dir.join(s.key().clone() + ext);
             let uri = lsp::Url::from_file_path(path).ok()?;
-            Some(lsp::WorkspaceSymbol {
-                location: lsp::OneOf::Right(lsp::WorkspaceLocation { uri }),
+                let last_line_idx = s.definition.as_ref()?.lines().count().saturating_sub(1);
+                let last_line_idx = u32::try_from(last_line_idx).unwrap_or(u32::MAX);
+                let end = lsp::Position::new(last_line_idx, 0);
+                let range = lsp::Range::new(lsp::Position::new(0, 0), end);
+                Some((
+                    match s.key().starts_with(query) {
+                        true => score + 1000,
+                        false => score,
+                    },
+                    lsp::SymbolInformation {
+                        name: s.key().clone(),
                 kind: lsp::SymbolKind::VARIABLE,
-                name: s.key().clone(),
+                        tags: None,
+                        location: lsp::Location::new(uri, range),
                 container_name: None,
-                tags: None,
-                data: None,
+                        #[allow(deprecated)]
+                        deprecated: None,
+                    },
+                ))
             })
-        };
-        let symbols = self.state.symbols.par_iter().filter_map(map).collect();
-        Ok(Some(lsp::WorkspaceSymbolResponse::Nested(symbols)))
+            .collect::<Vec<_>>();
+
+        symbols.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        symbols.truncate(100);
+
+        let symbols = symbols.into_iter().map(|(_, s)| s).collect();
+
+        Ok(Some(lsp::WorkspaceSymbolResponse::Flat(symbols)))
     }
 
     async fn definition(self, p: lsp::GotoDefinitionParams) -> Req<R::GotoDefinition> {
@@ -588,6 +621,7 @@ impl Server {
     async fn initialize(self, p: lsp::InitializeParams) -> Req<R::Initialize> {
         info!("{CRATE_NAME} v{}", clap::crate_version!());
         debug!("initialization_options `{:#?}`", p.initialization_options);
+        debug!("client capabilities: {:#?}", p.capabilities);
 
         let try_startup = self.startup(p).await;
         try_startup.inspect_err(|e| error!("startup fail: {e}"))?;
@@ -613,7 +647,10 @@ impl Server {
                 })),
                 semantic_tokens_provider: symbols_highlight.is_some_and(|enable| enable).then_some(
                     lsp::SemanticTokensServerCapabilities::SemanticTokensOptions({
-                        let token_types = self.state.token_types.get().cloned().unwrap_or_default();
+                        let cap = self.state.client_capabilities.get();
+                        let cap = cap.cloned().unwrap_or_default().text_document;
+                        let cap = cap.and_then(|d| d.semantic_tokens);
+                        let token_types = cap.map(|st| st.token_types).unwrap_or_default();
                         lsp::SemanticTokensOptions {
                             legend: lsp::SemanticTokensLegend {
                                 token_types,
