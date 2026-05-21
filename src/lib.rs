@@ -388,7 +388,7 @@ impl Server {
             false => text_document.to_string().to_lowercase(),
         };
 
-        let symbols = self
+        let mut symbols = self
             .state
             .symbols
             .par_iter()
@@ -431,6 +431,8 @@ impl Server {
             })
             .flatten()
             .collect::<Vec<_>>();
+
+        symbols.sort_unstable_by_key(|s| s.range.start);
 
         Ok(Some(lsp::DocumentSymbolResponse::Nested(symbols)))
     }
@@ -779,7 +781,7 @@ pub fn init_registry(debug_level_in_release: bool) {
 
     let f = |m: &tracing::Metadata<'_>| m.name() != "service_ready";
     let layer = tracing_subscriber::fmt::layer()
-        .without_time()
+        // .without_time()
         .with_ansi(false)
         .with_target(cfg!(debug_assertions) | debug_level_in_release)
         .with_writer(cfg_select! {
