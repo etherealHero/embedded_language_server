@@ -609,16 +609,64 @@ impl Server {
         Ok(Some(lsp::GotoDefinitionResponse::Scalar(location)))
     }
 
-    async fn completion(self, _: lsp::CompletionParams) -> Req<R::Completion> {
-        let map = |s: SymbolRef| lsp::CompletionItem {
-            label: s.key().to_string(),
-            documentation: Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
-                kind: lsp::MarkupKind::Markdown,
-                value: s.hover.clone().unwrap_or_default(),
-            })),
-            ..Default::default()
+    async fn completion(self, p: lsp::CompletionParams) -> Req<R::Completion> {
+        let url = p.text_document_position.text_document.uri;
+        let Ok(text_document) = self.state.get_text_document(url) else {
+            return Ok(None);
         };
-        let completions = self.state.symbols.par_iter().map(map).collect();
+
+        let pos = p.text_document_position.position;
+        let line = text_document.get_line(pos.line as _).map(String::from);
+        let line = line.context("line_idx is out of bounds")?;
+        let offset = utf16_offset_to_utf8(&line, pos.character as _);
+        let offset = offset.context("utf16_offset_to_utf8 coversion error")?;
+        let trim_line = line.split_at(offset).0;
+        let Some(ref trim_ident) = self.get_ident_on_line(trim_line, pos) else {
+            return Ok(None);
+        };
+
+        debug!("trim_ident: `{trim_ident}`");
+
+        if trim_ident.len() < 3 {
+            return Ok(None);
+        }
+
+        let matcher = &mut nucleo_matcher::Matcher::default();
+        let pattern = nucleo_matcher::pattern::Pattern::parse(
+            trim_ident,
+            nucleo_matcher::pattern::CaseMatching::Smart,
+            nucleo_matcher::pattern::Normalization::Smart,
+        );
+
+        let mut buf = vec![];
+        let mut completions = self
+            .state
+            .symbols
+            .iter()
+            .filter_map(|s| {
+                let haystack = nucleo_matcher::Utf32Str::new(s.key(), &mut buf);
+                let score = pattern.score(haystack, matcher)?;
+                let score = match s.key().starts_with(trim_ident) {
+                    true => score + 1000,
+                    false => score,
+                };
+                let completion = lsp::CompletionItem {
+                    label: s.key().to_string(),
+                    documentation: Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
+                        kind: lsp::MarkupKind::Markdown,
+                        value: s.hover.clone().unwrap_or_default(),
+                    })),
+                    ..Default::default()
+                };
+                Some((score, completion))
+            })
+            .collect::<Vec<_>>();
+
+        completions.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
+        completions.truncate(100);
+
+        let completions = completions.into_iter().map(|(_, s)| s).collect();
+
         Ok(Some(lsp::CompletionResponse::Array(completions)))
     }
 
