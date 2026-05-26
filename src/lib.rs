@@ -381,6 +381,37 @@ impl Server {
 
     async fn document_symbol(self, p: lsp::DocumentSymbolParams) -> Req<R::DocumentSymbolRequest> {
         let url = p.text_document.uri;
+        let hierarchical_document_symbol_support = self
+            .state
+            .client_capabilities
+            .get_or_init(lsp::ClientCapabilities::default)
+            .text_document
+            .as_ref()
+            .and_then(|d| {
+                d.document_symbol
+                    .as_ref()
+                    .map(|s| s.hierarchical_document_symbol_support.is_some_and(|t| t))
+            })
+            .unwrap_or_default();
+
+        let resolve_symbols = if hierarchical_document_symbol_support {
+            true
+        } else {
+            let iter = self.state.symbols.par_iter();
+            let is_symbol_doc = |symbol: SymbolRef| {
+                let ext = symbol.definition_file_ext.clone()?;
+                let filename = symbol.key().to_owned() + &ext;
+                let path = self.state.cache_dir.join(filename);
+                let symbol_uri = lsp::Url::from_file_path(path).ok()?;
+                symbol_uri.eq(&url).then_some(true)
+            };
+            iter.find_map_first(is_symbol_doc).unwrap_or_default()
+        };
+
+        if !resolve_symbols {
+            return Ok(None);
+        }
+
         let case_sensitive = self.state.config.case_sensitive.unwrap_or(true);
         let text_document = self.state.get_text_document(url.clone())?;
         let text_document_by_case_sensitive = match case_sensitive {
