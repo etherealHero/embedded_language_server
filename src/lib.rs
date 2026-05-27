@@ -575,6 +575,8 @@ impl Server {
             .filter_map(|s| {
                 let haystack = nucleo_matcher::Utf32Str::new(s.key(), &mut buf);
                 let score = pattern.score(haystack, matcher)?;
+                let len_penalty = u32::try_from(s.key().len().abs_diff(query.len())).ok()?;
+                let score = score.saturating_sub(len_penalty);
                 let ext = s.definition_file_ext.as_ref()?;
                 let path = self.state.cache_dir.join(s.key().clone() + ext);
                 let uri = lsp::Url::from_file_path(path).ok()?;
