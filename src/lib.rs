@@ -167,11 +167,8 @@ impl ServerState {
             Ok(path)
         }
     }
-}
-
-impl Server {
     async fn query(&self, query: &str) -> Result<Vec<dt::tiberius::Row>> {
-        let pool = self.state.pool.try_lock()?.as_ref().cloned();
+        let pool = self.pool.try_lock()?.as_ref().cloned();
         let pool = pool.context("connection pool not initialized")?;
         let pool_timeouts = dt::deadpool::managed::Timeouts {
             wait: Some(std::time::Duration::from_secs(10)),
@@ -191,6 +188,45 @@ impl Server {
         Ok(result.inspect(|r| info!("execute query success: {} rows selected", r.len()))?)
     }
 
+    async fn initialize_symbols(&self) -> Result<()> {
+        let config = &self.config;
+        let manager = match config.trust_cert.is_some_and(|t| t) {
+            true => dt::Manager::from_ado_string(&config.ado_connection_string)?.trust_cert(),
+            false => dt::Manager::from_ado_string(&config.ado_connection_string)?,
+        };
+
+        let new_pool = manager
+            .wait_timeout(std::time::Duration::from_secs(5))
+            .create_pool()
+            .inspect_err(|e| error!("create pool error: {e}"))?;
+
+        {
+            let mut unit_pool = self.pool.lock().await;
+            *unit_pool = Some(new_pool);
+            info!("create pool success");
+        } // lock free
+
+        let get_prop = |row: &dt::tiberius::Row, prop: &str| {
+            let try_get_prop = row.try_get::<&str, &str>(prop);
+            try_get_prop.unwrap_or_default().map(String::from)
+        };
+
+        for row in self.query(&config.get_symbols_query).await? {
+            let ident = row.try_get::<&str, &str>("Identifier")?;
+            let ident = ident.context("'Identifier' column must be string")?;
+            let symbol = SymbolInfo {
+                hover: get_prop(&row, "HoverInfo"),
+                definition: get_prop(&row, "DefinitionInfo"),
+                definition_file_ext: get_prop(&row, "DefinitionFileExtension"),
+            };
+            self.symbols.insert(ident.into(), symbol);
+        }
+
+        Ok(())
+    }
+}
+
+impl Server {
     async fn startup(&self, p: lsp::InitializeParams) -> Result<()> {
         let cap = p.capabilities.text_document.as_ref();
         let st_cap = cap.and_then(|c| c.semantic_tokens.as_ref());
@@ -213,38 +249,6 @@ impl Server {
             Some(idx) => self.state.token_type_highlight_idx.set(idx).unwrap(),
             None => warn!("{typ:?} not found at client token_types capabilities"),
         };
-
-        let manager = match config.trust_cert.is_some_and(|t| t) {
-            true => dt::Manager::from_ado_string(&config.ado_connection_string)?.trust_cert(),
-            false => dt::Manager::from_ado_string(&config.ado_connection_string)?,
-        };
-
-        let new_pool = manager
-            .wait_timeout(std::time::Duration::from_secs(5))
-            .create_pool()
-            .inspect_err(|e| error!("create pool error: {e}"))?;
-
-        {
-            let mut unit_pool = self.state.pool.lock().await;
-            *unit_pool = Some(new_pool);
-            info!("create pool success");
-        } // lock free
-
-        let get_prop = |row: &dt::tiberius::Row, prop: &str| {
-            let try_get_prop = row.try_get::<&str, &str>(prop);
-            try_get_prop.unwrap_or_default().map(String::from)
-        };
-
-        for row in self.query(&config.get_symbols_query).await? {
-            let ident = row.try_get::<&str, &str>("Identifier")?;
-            let ident = ident.context("'Identifier' column must be string")?;
-            let symbol = SymbolInfo {
-                hover: get_prop(&row, "HoverInfo"),
-                definition: get_prop(&row, "DefinitionInfo"),
-                definition_file_ext: get_prop(&row, "DefinitionFileExtension"),
-            };
-            self.state.symbols.insert(ident.into(), symbol);
-        }
 
         Ok(())
     }
@@ -818,7 +822,16 @@ impl Server {
         add_request::<R::Shutdown, _, _>(&mut router, Server::shutdown);
 
         router
-            .notification::<N::Initialized>(|_, _| F::Continue(()))
+            .notification::<N::Initialized>(|st, _| {
+                let st = Arc::clone(st);
+                tokio::spawn(async move {
+                    match st.initialize_symbols().await {
+                        Ok(_) => info!("initialize symbols ok"),
+                        Err(e) => error!("initialize symbols fail: {e:?}"),
+                    }
+                });
+                F::Continue(())
+            })
             .notification::<N::DidChangeConfiguration>(|_, _| F::Continue(()))
             .notification::<N::DidOpenTextDocument>(|st, p| {
                 let event = lsp::TextDocumentContentChangeEvent {
