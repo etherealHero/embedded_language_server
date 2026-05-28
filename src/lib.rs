@@ -12,6 +12,7 @@ type SymbolRef<'a> = dashmap::mapref::multiple::RefMulti<'a, String, SymbolInfo>
 type _Notify = F<std::result::Result<(), async_lsp::Error>>;
 
 const CRATE_NAME: &str = clap::crate_name!();
+const OUTPUT_RING_SIZE: u8 = 10;
 
 static APP: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
     let exe = std::env::current_exe().unwrap();
@@ -109,10 +110,14 @@ struct ServerState {
     symbols: dashmap::DashMap<String, SymbolInfo>,
     url_to_path: dashmap::DashMap<lsp::Url, PathBuf>,
     text_documents: dashmap::DashMap<PathBuf, ropey::Rope>,
+    token_type_highlight_idx: std::sync::OnceLock<u32>,
 
     _client: Option<async_lsp::ClientSocket>,
+    client_info: std::sync::OnceLock<Option<lsp::ClientInfo>>,
     client_capabilities: std::sync::OnceLock<lsp::ClientCapabilities>,
-    token_type_highlight_idx: std::sync::OnceLock<u32>,
+
+    compact_emit_process: std::sync::OnceLock<bool>,
+    compact_output_buffer_idx: Arc<std::sync::atomic::AtomicU8>,
 }
 
 struct Server {
@@ -167,6 +172,7 @@ impl ServerState {
             Ok(path)
         }
     }
+
     async fn query(&self, query: &str) -> Result<Vec<dt::tiberius::Row>> {
         let pool = self.pool.try_lock()?.as_ref().cloned();
         let pool = pool.context("connection pool not initialized")?;
@@ -188,12 +194,58 @@ impl ServerState {
         Ok(result.inspect(|r| info!("execute query success: {} rows selected", r.len()))?)
     }
 
+    fn emit_symbol_definition(&self, symbol: (String, SymbolInfo)) -> Result<lsp::Url> {
+        let compact = self.compact_emit_process.get().cloned().unwrap_or_default();
+        let symbol_info = &symbol.1;
+        if !std::fs::exists(&self.cache_dir)? {
+            std::fs::create_dir_all(&self.cache_dir)?
+        };
+        ensure!(symbol_info.definition_file_ext.is_some() & symbol_info.definition.is_some());
+        let definition_file_ext = symbol.1.definition_file_ext.unwrap();
+        let file = self.cache_dir.join(&if compact {
+            let ord = std::sync::atomic::Ordering::SeqCst;
+            let buf_idx = self.compact_output_buffer_idx.load(ord) % OUTPUT_RING_SIZE;
+            self.compact_output_buffer_idx.fetch_add(1, ord);
+            format!("output{buf_idx}.md")
+        } else {
+            symbol.0.to_owned() + &definition_file_ext
+        });
+        let contents = if compact {
+            match definition_file_ext.clone() {
+                s if s == ".md" => symbol.1.definition.unwrap(),
+                s if s.starts_with(".") && s.len() > 1 => format!(
+                    "\n```{}\n{}\n```\n",
+                    definition_file_ext.split_at(1).1,
+                    symbol.1.definition.unwrap()
+                ),
+                _ => symbol.1.definition.unwrap(),
+            }
+        } else {
+            symbol.1.definition.unwrap()
+        };
+        std::fs::write(&file, contents)?;
+        debug!("symbol '{}' emitted on disk", symbol.0);
+        Ok(lsp::Url::from_file_path(file).unwrap())
+    }
+
     async fn initialize_symbols(&self) -> Result<()> {
         let config = &self.config;
+        let client_info = self.client_info.get().cloned().unwrap();
         let manager = match config.trust_cert.is_some_and(|t| t) {
             true => dt::Manager::from_ado_string(&config.ado_connection_string)?.trust_cert(),
             false => dt::Manager::from_ado_string(&config.ado_connection_string)?,
         };
+
+        if client_info.is_some_and(|i| i.name.contains("WebStorm")) {
+            // issue on webstorm by it use VFS for indexing workspace
+            self.compact_emit_process.set(true).unwrap();
+            if !std::fs::exists(&self.cache_dir)? {
+                std::fs::create_dir_all(&self.cache_dir)?
+            };
+            for i in 0..OUTPUT_RING_SIZE {
+                std::fs::write(&self.cache_dir.join(format!("output{i}.md")), "")?;
+            }
+        }
 
         let new_pool = manager
             .wait_timeout(std::time::Duration::from_secs(5))
@@ -244,6 +296,7 @@ impl Server {
 
         debug!("token_types: `{tt:?}`");
         self.state.client_capabilities.set(p.capabilities).unwrap();
+        self.state.client_info.set(p.client_info).unwrap();
 
         match idx.flatten() {
             Some(idx) => self.state.token_type_highlight_idx.set(idx).unwrap(),
@@ -300,21 +353,6 @@ impl Server {
         };
         symbol_pair.is_none().then(trace);
         symbol_pair
-    }
-
-    fn emit_symbol_definition(&self, symbol: (String, SymbolInfo)) -> Result<lsp::Url> {
-        if !std::fs::exists(&self.state.cache_dir)? {
-            std::fs::create_dir_all(&self.state.cache_dir)?
-        };
-
-        let symbol_info = &symbol.1;
-        ensure!(symbol_info.definition_file_ext.is_some() & symbol_info.definition.is_some());
-
-        let name = symbol.0.to_owned() + &symbol.1.definition_file_ext.unwrap();
-        let file = self.state.cache_dir.join(name);
-
-        std::fs::write(&file, symbol.1.definition.unwrap())?;
-        Ok(lsp::Url::from_file_path(file).unwrap())
     }
 }
 
@@ -481,12 +519,12 @@ impl Server {
 
         let case_sensitive = self.state.config.case_sensitive.unwrap_or(true);
         let symbol_to_search_len = symbol_to_search.len() as u32;
-        let symbol_to_search = &match case_sensitive {
-            true => symbol_to_search,
+        let symbol_to_search_by_case_sensitive = &match case_sensitive {
+            true => symbol_to_search.clone(),
             false => symbol_to_search.to_lowercase(),
         };
 
-        let locations: Vec<_> = self
+        let mut locations: Vec<_> = self
             .state
             .symbols
             .par_iter()
@@ -499,7 +537,7 @@ impl Server {
                     false => symbol.definition.clone()?.to_lowercase(),
                 };
 
-                let locations: Vec<_> = definition_by_case_sensitive
+                let mut locations: Vec<_> = definition_by_case_sensitive
                     .lines()
                     .enumerate()
                     .par_bridge()
@@ -507,7 +545,7 @@ impl Server {
                     .filter_map(|(line_idx, line): (usize, &str)| {
                         let line_idx = u32::try_from(line_idx).ok()?;
                         let line_ranges: Vec<_> = line
-                            .match_indices(symbol_to_search)
+                            .match_indices(symbol_to_search_by_case_sensitive)
                             .filter_map(|(offset, _)| {
                                 let c = u32::try_from(utf8_offset_to_utf16(line, offset)?).ok()?;
                                 Some(lsp::Position::new(line_idx, c))
@@ -529,34 +567,117 @@ impl Server {
                     .map(|range| lsp::Location::new(uri.clone(), range))
                     .collect();
 
-                if !locations.is_empty() {
+                locations.sort_by_key(|l| l.range.start);
+
+                let full_emit = self.state.compact_emit_process.get().is_none_or(|c| !c);
+                if full_emit && !locations.is_empty() {
                     let symbol = (symbol.key().to_string(), symbol.value().clone());
                     let msg = "Error on omit symbol reference";
-                    let try_emit = self.emit_symbol_definition(symbol);
+                    let try_emit = self.state.emit_symbol_definition(symbol);
                     try_emit.inspect_err(|e| error!("{msg}: {e}")).ok()?;
-                    Some(locations)
-                } else {
-                    None
-                }
+                };
+
+                Some(locations)
             })
             .collect::<Vec<_>>()
             .into_par_iter()
             .flatten()
             .collect();
 
-        Ok(Some(locations))
+        locations.sort_by_key(|l| l.uri.as_str().to_string());
+        debug!("locations: `{locations:#?}`");
+
+        if self.state.compact_emit_process.get().is_none_or(|c| !c) {
+            return Ok(Some(locations));
+        }
+
+        use itertools::Itertools;
+
+        let mut source_idx = 1;
+        let mut buf = format!(
+            "Found {} references of '{}' symbol\n",
+            locations.len(),
+            symbol_to_search
+        );
+
+        let symbol_of = |l: &lsp::Location| {
+            let path = l.uri.to_file_path().unwrap();
+            path.file_stem().unwrap().to_str().unwrap().to_string()
+        };
+
+        fn merge_lines(lines: &[usize]) -> Vec<(usize, usize)> {
+            if lines.is_empty() {
+                return vec![];
+            }
+            let mut merged = vec![];
+            let mut start = lines[0];
+            let mut end = lines[0];
+            for &line in &lines[1..] {
+                if line <= end + 1 {
+                    end = line;
+                } else {
+                    merged.push((start, end));
+                    start = line;
+                    end = line;
+                }
+            }
+            merged.push((start, end));
+            merged
+        }
+
+        for (_uri, group) in &locations.iter().chunk_by(|l| l.uri.clone()) {
+            let group: Vec<_> = group.collect();
+            let symbol_name = symbol_of(group.first().unwrap());
+            let symbol_info = self.state.symbols.get(&symbol_name).unwrap();
+            let definition = symbol_info.definition.as_ref().unwrap();
+            let definition_lines: Vec<_> = definition.lines().collect();
+            let mut refs: Vec<usize> = group.iter().map(|l| l.range.start.line as usize).collect();
+            refs.sort_unstable();
+            buf += &format!("\n{source_idx}) At {symbol_name}:\n");
+            let merged = merge_lines(&refs);
+            for (idx, (start, end)) in merged.iter().enumerate() {
+                let from = start.saturating_sub(1);
+                let to = end.saturating_add(1);
+                for line_idx in from..=to {
+                    let Some(line) = definition_lines.get(line_idx) else {
+                        continue;
+                    };
+                    let marker = match line_idx >= *start && line_idx <= *end {
+                        true => ":",
+                        false => " ",
+                    };
+                    buf += &format!("\t{line_idx}{marker}\t{line}\n");
+                }
+                if idx + 1 != merged.len() {
+                    buf += "\n";
+                }
+            }
+            source_idx += 1;
+        }
+
+        let ord = std::sync::atomic::Ordering::SeqCst;
+        let buf_idx = self.state.compact_output_buffer_idx.load(ord) % OUTPUT_RING_SIZE;
+        let file = self.state.cache_dir.join(format!("output{buf_idx}.md"));
+        let uri = lsp::Url::from_file_path(&file).unwrap();
+        let end_line = u32::try_from(buf.lines().count() - 1).unwrap_or(u32::MAX);
+        let range = lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(end_line, 0));
+
+        debug!("buf: `{buf}`");
+        debug!("compact buffer location: `{:#?}`", (&uri, range));
+        std::fs::write(file, buf)?;
+        self.state.compact_output_buffer_idx.fetch_add(1, ord);
+        Ok(Some(vec![lsp::Location::new(uri, range)]))
     }
 
     async fn ws_symbol_resolve(self, p: lsp::WorkspaceSymbol) -> Req<R::WorkspaceSymbolResolve> {
         let symbol = self.get_symbol(&p.name).context("Expect symbol resolve")?;
-        let try_emit = self.emit_symbol_definition(symbol);
-        try_emit.inspect_err(|e| error!("emit_symbol_definition error: {e}"))?;
+        let _ = self.state.emit_symbol_definition(symbol)?;
         Ok(p)
     }
 
     async fn ws_symbol(self, p: lsp::WorkspaceSymbolParams) -> Req<R::WorkspaceSymbolRequest> {
         let query = p.query.trim();
-        if query.is_empty() {
+        if query.is_empty() || query.len() < 3 {
             return Ok(None);
         }
 
@@ -605,6 +726,7 @@ impl Server {
         symbols.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
         symbols.truncate(100);
 
+        let full_emit = self.state.compact_emit_process.get().is_none_or(|c| !c);
         let client_resolve_support = self
             .state
             .client_capabilities
@@ -614,16 +736,42 @@ impl Server {
             .and_then(|w| w.symbol.as_ref().map(|s| s.resolve_support.is_some()))
             .unwrap_or_default();
 
-        if !client_resolve_support {
+        if !client_resolve_support && full_emit {
             symbols.par_iter().for_each(|(_, s)| {
                 if !std::fs::exists(self.state.cache_dir.join(&s.name)).is_ok_and(|e| e) {
-                    let _ = self.emit_symbol_definition(self.get_symbol(&s.name).unwrap());
+                    let symbol = self.get_symbol(&s.name).unwrap();
+                    let _ = self.state.emit_symbol_definition(symbol);
                 };
             });
         }
 
-        let symbols = symbols.into_iter().map(|(_, s)| s).collect();
+        if self.state.compact_emit_process.get().is_none_or(|c| !c) {
+            let symbols = symbols.into_iter().map(|(_, s)| s).collect();
+            return Ok(Some(lsp::WorkspaceSymbolResponse::Flat(symbols)));
+        }
 
+        let ord = std::sync::atomic::Ordering::SeqCst;
+        let buf_idx = self.state.compact_output_buffer_idx.load(ord) % OUTPUT_RING_SIZE;
+        let file = self.state.cache_dir.join(format!("output{buf_idx}.md"));
+        let uri = &lsp::Url::from_file_path(&file).unwrap();
+        let mut buf = format!("Workspace symbols of '{query}' search:\n");
+        let symbols = symbols
+            .into_iter()
+            .filter_map(|(_, s)| {
+                buf += &s.name;
+                buf += "\n";
+                Some(lsp::SymbolInformation {
+                    location: lsp::Location::new(
+                        uri.clone(),
+                        lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0)),
+                    ),
+                    ..s
+                })
+            })
+            .collect();
+
+        std::fs::write(file, &buf)?;
+        self.state.compact_output_buffer_idx.fetch_add(1, ord);
         Ok(Some(lsp::WorkspaceSymbolResponse::Flat(symbols)))
     }
 
@@ -640,7 +788,7 @@ impl Server {
             return Ok(None);
         }
         let zero_range = lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0));
-        let output_file_uri = self.emit_symbol_definition((symbol, symbol_info))?;
+        let output_file_uri = self.state.emit_symbol_definition((symbol, symbol_info))?;
         let location = lsp::Location::new(output_file_uri, zero_range);
 
         Ok(Some(lsp::GotoDefinitionResponse::Scalar(location)))
@@ -702,6 +850,14 @@ impl Server {
         completions.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
         completions.truncate(100);
 
+        debug!(
+            "`{:?}` completions found",
+            completions
+                .iter()
+                .map(|c| c.1.label.clone())
+                .collect::<Vec<_>>()
+        );
+
         let completions = completions.into_iter().map(|(_, s)| s).collect();
 
         Ok(Some(lsp::CompletionResponse::Array(completions)))
@@ -725,6 +881,7 @@ impl Server {
         info!("{CRATE_NAME} v{}", clap::crate_version!());
         debug!("initialization_options `{:#?}`", p.initialization_options);
         debug!("client capabilities: {:#?}", p.capabilities);
+        debug!("client info: {:#?}", p.client_info);
 
         let try_startup = self.startup(p).await;
         try_startup.inspect_err(|e| error!("startup fail: {e}"))?;
