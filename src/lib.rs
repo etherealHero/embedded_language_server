@@ -1097,7 +1097,7 @@ pub async fn run_service(opt: lsp::OneOf<ConfigPath, CacheDir>) -> Result<()> {
             let p = resolve_path(&config_path)?;
             let p = dunce::canonicalize(p).inspect(|p| info!("config: {}", p.display()))?;
             let cache_dir = p.parent().context("extract folder of config path fail")?;
-            let cache_dir = cache_dir.join(format!("{CRATE_NAME}_output/{}/", *APP));
+            let cache_dir = cache_dir.join(".els/");
             let config = Config::parse(&p)?;
             (config, cache_dir)
         }
