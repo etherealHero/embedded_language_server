@@ -68,7 +68,9 @@ pub struct Config {
     pub case_sensitive: Option<bool>,
     pub get_symbols_query: String,
     pub sign: String,
-
+    /// May contains {{SYMBOL}} literal to inject symbol name parameter
+    /// See [`ServerState::update_symbol`] for more details
+    update_symbol_query: Option<String>,
     symbols_highlight: Option<bool>,
 }
 
@@ -80,9 +82,11 @@ impl Config {
 
     pub fn sign_key(&self) -> String {
         use sha2::Digest;
+        let update_symbol_query = self.update_symbol_query.clone().unwrap_or_default();
         let mut hasher = sha2::Sha256::new();
         hasher.update(dotenv_codegen::dotenv!("SECRET").as_bytes());
         hasher.update(self.get_symbols_query.as_bytes());
+        hasher.update(update_symbol_query.as_bytes());
         hex::encode(hasher.finalize())
     }
 
@@ -100,6 +104,7 @@ struct SymbolInfo {
     hover: Option<String>,
     definition: Option<String>,
     definition_file_ext: Option<String>,
+    create_datetime: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Default)]
@@ -185,7 +190,7 @@ impl ServerState {
         info!("execute query...");
         let mut conn = pool.timeout_get(&pool_timeouts).await?;
         let running_query = async { conn.simple_query(query).await?.into_first_result().await };
-        let timeout_duration = std::time::Duration::from_secs(30);
+        let timeout_duration = std::time::Duration::from_secs(60);
         let Ok(result) = tokio::time::timeout(timeout_duration, running_query).await else {
             dt::deadpool::managed::Object::take(conn).close().await?;
             bail!("execute query timeout")
@@ -228,6 +233,22 @@ impl ServerState {
         Ok(lsp::Url::from_file_path(file).unwrap())
     }
 
+    fn parse_symbol(&self, row: &dt::tiberius::Row) -> Result<(String, SymbolInfo)> {
+        let get_prop = |row: &dt::tiberius::Row, prop: &str| {
+            let try_get_prop = row.try_get::<&str, &str>(prop);
+            try_get_prop.unwrap_or_default().map(String::from)
+        };
+        let ident = row.try_get::<&str, &str>("Identifier")?;
+        let symbol = ident.context("'Identifier' column must be string")?.into();
+        let symbol_info = SymbolInfo {
+            hover: get_prop(&row, "HoverInfo"),
+            definition: get_prop(&row, "DefinitionInfo"),
+            definition_file_ext: get_prop(&row, "DefinitionFileExtension"),
+            create_datetime: chrono::Utc::now(),
+        };
+        Ok((symbol, symbol_info))
+    }
+
     async fn initialize_symbols(&self) -> Result<()> {
         let config = &self.config;
         let client_info = self.client_info.get().cloned().unwrap();
@@ -258,22 +279,22 @@ impl ServerState {
             info!("create pool success");
         } // lock free
 
-        let get_prop = |row: &dt::tiberius::Row, prop: &str| {
-            let try_get_prop = row.try_get::<&str, &str>(prop);
-            try_get_prop.unwrap_or_default().map(String::from)
-        };
-
         for row in self.query(&config.get_symbols_query).await? {
-            let ident = row.try_get::<&str, &str>("Identifier")?;
-            let ident = ident.context("'Identifier' column must be string")?;
-            let symbol = SymbolInfo {
-                hover: get_prop(&row, "HoverInfo"),
-                definition: get_prop(&row, "DefinitionInfo"),
-                definition_file_ext: get_prop(&row, "DefinitionFileExtension"),
-            };
-            self.symbols.insert(ident.into(), symbol);
+            let (symbol, info) = self.parse_symbol(&row)?;
+            self.symbols.insert(symbol, info);
         }
 
+        Ok(())
+    }
+
+    async fn update_symbol(&self, symbol: &str) -> Result<()> {
+        let query = self.config.update_symbol_query.as_ref();
+        let query = query.context("config update_symbol_query not set")?;
+        let row = self.query(&query.replace("{{SYMBOL}}", symbol)).await?;
+        let context = "update_symbol_query should return one row";
+        let (symbol, info) = self.parse_symbol(row.first().context(context)?)?;
+        debug!("symbol {symbol} updated");
+        self.symbols.insert(symbol, info);
         Ok(())
     }
 }
@@ -781,16 +802,21 @@ impl Server {
         let Some((symbol, symbol_info)) = self.get_symbol_on_text_document(url, position)? else {
             return Ok(None);
         };
-        ensure!(symbol_info.definition_file_ext.is_some() & symbol_info.definition.is_some());
-
         if symbol_info.definition.is_none() | symbol_info.definition_file_ext.is_none() {
-            warn!("definition info of `{symbol}` symbol not found");
+            warn!("definition info of `{symbol}` symbol not set");
             return Ok(None);
         }
+        let debaunce = (chrono::Utc::now() - symbol_info.create_datetime).num_seconds() < 3;
+        let (symbol, symbol_info) = if debaunce {
+            (symbol, symbol_info)
+        } else {
+            let update = self.state.update_symbol(&symbol).await;
+            let _ = update.inspect_err(|e| error!("update symbol error: {e}"));
+            self.get_symbol(&symbol).unwrap()
+        };
         let zero_range = lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0));
         let output_file_uri = self.state.emit_symbol_definition((symbol, symbol_info))?;
         let location = lsp::Location::new(output_file_uri, zero_range);
-
         Ok(Some(lsp::GotoDefinitionResponse::Scalar(location)))
     }
 
