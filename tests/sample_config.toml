@@ -7,6 +7,8 @@ ado_connection_string = "Server=127.0.0.1,1433;Database=AdventureWorks2022;Integ
 # - 'HoverInfo' string, nullable, optional
 # - 'DefinitionInfo' string, nullable, optional
 # - 'DefinitionFileExtension' string, nullable, optional
+# - 'SymbolKind' string, nullable, optional (will be parse into i32 SymbolKind https://docs.rs/crate/lsp-types/0.95.1/source/src/lib.rs#1245-1270)
+# - 'MoreDetail' string, nullable, optional
 get_symbols_query = """
 select
     s.name as [Identifier],

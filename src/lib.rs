@@ -106,6 +106,8 @@ struct SymbolInfo {
     definition: Option<String>,
     definition_file_ext: Option<String>,
     create_datetime: chrono::DateTime<chrono::Utc>,
+    kind: lsp::SymbolKind,
+    more_detail: Option<String>,
 }
 
 #[derive(Default)]
@@ -246,6 +248,39 @@ impl ServerState {
             definition: get_prop(&row, "DefinitionInfo"),
             definition_file_ext: get_prop(&row, "DefinitionFileExtension"),
             create_datetime: chrono::Utc::now(),
+            more_detail: get_prop(&row, "MoreDetail"),
+            kind: match get_prop(&row, "SymbolKind")
+                .unwrap_or_default()
+                .parse::<i32>()
+            {
+                Ok(k) if k == 1 => lsp::SymbolKind::FILE,
+                Ok(k) if k == 2 => lsp::SymbolKind::MODULE,
+                Ok(k) if k == 3 => lsp::SymbolKind::NAMESPACE,
+                Ok(k) if k == 4 => lsp::SymbolKind::PACKAGE,
+                Ok(k) if k == 5 => lsp::SymbolKind::CLASS,
+                Ok(k) if k == 6 => lsp::SymbolKind::METHOD,
+                Ok(k) if k == 7 => lsp::SymbolKind::PROPERTY,
+                Ok(k) if k == 8 => lsp::SymbolKind::FIELD,
+                Ok(k) if k == 9 => lsp::SymbolKind::CONSTRUCTOR,
+                Ok(k) if k == 10 => lsp::SymbolKind::ENUM,
+                Ok(k) if k == 11 => lsp::SymbolKind::INTERFACE,
+                Ok(k) if k == 12 => lsp::SymbolKind::FUNCTION,
+                Ok(k) if k == 13 => lsp::SymbolKind::VARIABLE,
+                Ok(k) if k == 14 => lsp::SymbolKind::CONSTANT,
+                Ok(k) if k == 15 => lsp::SymbolKind::STRING,
+                Ok(k) if k == 16 => lsp::SymbolKind::NUMBER,
+                Ok(k) if k == 17 => lsp::SymbolKind::BOOLEAN,
+                Ok(k) if k == 18 => lsp::SymbolKind::ARRAY,
+                Ok(k) if k == 19 => lsp::SymbolKind::OBJECT,
+                Ok(k) if k == 20 => lsp::SymbolKind::KEY,
+                Ok(k) if k == 21 => lsp::SymbolKind::NULL,
+                Ok(k) if k == 22 => lsp::SymbolKind::ENUM_MEMBER,
+                Ok(k) if k == 23 => lsp::SymbolKind::STRUCT,
+                Ok(k) if k == 24 => lsp::SymbolKind::EVENT,
+                Ok(k) if k == 25 => lsp::SymbolKind::OPERATOR,
+                Ok(k) if k == 26 => lsp::SymbolKind::TYPE_PARAMETER,
+                _ => lsp::SymbolKind::VARIABLE,
+            },
         };
         Ok((symbol, symbol_info))
     }
@@ -384,6 +419,7 @@ impl Server {
         self,
         p: lsp::CallHierarchyPrepareParams,
     ) -> Req<R::CallHierarchyPrepare> {
+        let st = self.state.clone();
         let definition = self.definition(lsp::GotoDefinitionParams {
             text_document_position_params: p.text_document_position_params,
             work_done_progress_params: Default::default(),
@@ -395,13 +431,15 @@ impl Server {
             _ => unreachable!(),
         };
         let path = location.uri.to_file_path().unwrap();
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let symbol_info = st.get_symbol(&name).unwrap().1;
         let item = lsp::CallHierarchyItem {
-            name: path.file_stem().unwrap().to_str().unwrap().into(),
-            kind: lsp::SymbolKind::VARIABLE,
+            kind: symbol_info.kind,
             selection_range: location.range,
             range: location.range,
             uri: location.uri,
-            detail: None,
+            name,
+            detail: symbol_info.more_detail,
             tags: None,
             data: None,
         };
@@ -412,7 +450,7 @@ impl Server {
         self,
         p: lsp::CallHierarchyIncomingCallsParams,
     ) -> Req<R::CallHierarchyIncomingCalls> {
-        let symbol_of = |l: &lsp::Location| {
+        let symbol_name_of = |l: &lsp::Location| {
             let path = l.uri.to_file_path().unwrap();
             path.file_stem().unwrap().to_str().unwrap().to_string()
         };
@@ -421,7 +459,7 @@ impl Server {
             let pos = lsp::Position::new(0, 0);
             let zero_range = lsp::Range::new(pos, pos);
             let location = &lsp::Location::new(p.item.uri.clone(), zero_range);
-            let symbol_name = symbol_of(location);
+            let symbol_name = symbol_name_of(location);
             let symbol = self.state.symbols.get(&symbol_name);
             let Some(symbol) = symbol else {
                 break 'open_symbol None;
@@ -447,6 +485,7 @@ impl Server {
         };
 
         let target_symbol_name = symbol.0.clone();
+        let st = self.state.clone();
         let Some(locations) = self.symbol_references(symbol).await? else {
             return Ok(None);
         };
@@ -456,16 +495,18 @@ impl Server {
                 .into_iter()
                 .unique_by(|l| l.uri.clone())
                 .filter_map(|l| {
-                    symbol_of(&l).ne(&target_symbol_name).then_some(1)?;
+                    let symbol = symbol_name_of(&l);
+                    symbol.ne(&target_symbol_name).then_some(1)?;
+                    let symbol_info = st.get_symbol(&symbol)?.1;
                     Some(lsp::CallHierarchyIncomingCall {
                         from: lsp::CallHierarchyItem {
-                            name: symbol_of(&l),
-                            kind: lsp::SymbolKind::VARIABLE,
+                            name: symbol_name_of(&l),
+                            kind: symbol_info.kind,
                             uri: l.uri,
                             range: l.range,
                             selection_range: l.range,
                             tags: None,
-                            detail: None,
+                            detail: symbol_info.more_detail,
                             data: None,
                         },
                         from_ranges: vec![l.range],
@@ -521,16 +562,18 @@ impl Server {
             .unique_by(|s| s.name.clone())
             .filter_map(|s| {
                 let symbol = st.get_symbol(&s.name)?;
+                let kind = symbol.1.kind;
+                let detail = symbol.1.more_detail.clone();
                 let _ = st.emit_symbol_definition(symbol).ok()?;
                 Some(lsp::CallHierarchyOutgoingCall {
                     to: lsp::CallHierarchyItem {
+                        kind,
+                        detail,
                         name: s.name,
-                        kind: lsp::SymbolKind::VARIABLE,
                         uri: uri.clone(),
                         range: s.range,
                         selection_range: s.selection_range,
                         tags: None,
-                        detail: None,
                         data: None,
                     },
                     from_ranges: vec![s.range],
@@ -676,7 +719,7 @@ impl Server {
                             selection_range: lsp::Range::new(start, end),
                             detail: None,
                             children: None,
-                            kind: lsp::SymbolKind::VARIABLE,
+                            kind: s.value().kind,
                             tags: None,
                             #[allow(deprecated)]
                             deprecated: None,
