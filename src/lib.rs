@@ -4,6 +4,7 @@ use tracing::{debug, error, info, warn};
 
 use async_lsp::lsp_types::{self as lsp, notification as N, request as R};
 use deadpool_tiberius as dt;
+use itertools::Itertools;
 use rayon::iter::*;
 
 type Req<T> = std::result::Result<<T as R::Request>::Result, anyhow::Error>;
@@ -297,6 +298,22 @@ impl ServerState {
         self.symbols.insert(symbol, info);
         Ok(())
     }
+
+    fn get_symbol(&self, ident: &str) -> Option<(String, SymbolInfo)> {
+        let trace = || debug!("symbol by ident `{ident}` not found");
+        let symbol_pair = if self.config.case_sensitive.unwrap_or(true) {
+            let symbol = self.symbols.get(ident);
+            symbol.map(|s| (s.key().clone(), s.value().clone()))
+        } else {
+            let ident = ident.to_lowercase();
+            self.symbols.par_iter().find_map_first(|s| {
+                let matched = s.key().to_lowercase().eq(&ident);
+                matched.then_some((s.key().clone(), s.value().clone()))
+            })
+        };
+        symbol_pair.is_none().then(trace);
+        symbol_pair
+    }
 }
 
 impl Server {
@@ -356,29 +373,174 @@ impl Server {
         position: lsp::Position,
     ) -> Result<Option<(String, SymbolInfo)>> {
         self.get_ident_on_text_document(url, position)?
-            .map(|ident| Ok(self.get_symbol(&ident)))
+            .map(|ident| Ok(self.state.get_symbol(&ident)))
             .unwrap_or(Ok(None))
-    }
-
-    fn get_symbol(&self, ident: &str) -> Option<(String, SymbolInfo)> {
-        let trace = || debug!("symbol by ident `{ident}` not found");
-        let symbol_pair = if self.state.config.case_sensitive.unwrap_or(true) {
-            let symbol = self.state.symbols.get(ident);
-            symbol.map(|s| (s.key().clone(), s.value().clone()))
-        } else {
-            let ident = ident.to_lowercase();
-            self.state.symbols.par_iter().find_map_first(|s| {
-                let matched = s.key().to_lowercase().eq(&ident);
-                matched.then_some((s.key().clone(), s.value().clone()))
-            })
-        };
-        symbol_pair.is_none().then(trace);
-        symbol_pair
     }
 }
 
 /// [`lsp`] implementation
 impl Server {
+    async fn call_hierarchy_prepare(
+        self,
+        p: lsp::CallHierarchyPrepareParams,
+    ) -> Req<R::CallHierarchyPrepare> {
+        let definition = self.definition(lsp::GotoDefinitionParams {
+            text_document_position_params: p.text_document_position_params,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        });
+        let location = match definition.await? {
+            Some(lsp::GotoDefinitionResponse::Scalar(l)) => l,
+            None => return Ok(None),
+            _ => unreachable!(),
+        };
+        let path = location.uri.to_file_path().unwrap();
+        let item = lsp::CallHierarchyItem {
+            name: path.file_stem().unwrap().to_str().unwrap().into(),
+            kind: lsp::SymbolKind::VARIABLE,
+            selection_range: location.range,
+            range: location.range,
+            uri: location.uri,
+            detail: None,
+            tags: None,
+            data: None,
+        };
+        return Ok(Some(vec![item]));
+    }
+
+    async fn call_hierarchy_incoming_calls(
+        self,
+        p: lsp::CallHierarchyIncomingCallsParams,
+    ) -> Req<R::CallHierarchyIncomingCalls> {
+        let symbol_of = |l: &lsp::Location| {
+            let path = l.uri.to_file_path().unwrap();
+            path.file_stem().unwrap().to_str().unwrap().to_string()
+        };
+
+        let symbol = 'open_symbol: {
+            let pos = lsp::Position::new(0, 0);
+            let zero_range = lsp::Range::new(pos, pos);
+            let location = &lsp::Location::new(p.item.uri.clone(), zero_range);
+            let symbol_name = symbol_of(location);
+            let symbol = self.state.symbols.get(&symbol_name);
+            let Some(symbol) = symbol else {
+                break 'open_symbol None;
+            };
+            let Some(text) = symbol.value().definition.clone() else {
+                break 'open_symbol None;
+            };
+            let symbol = Some((symbol_name, symbol.value().clone()));
+            if self.state.get_text_document(p.item.uri.clone()).is_ok() {
+                break 'open_symbol symbol;
+            }
+            let event = lsp::TextDocumentContentChangeEvent {
+                text,
+                range_length: None,
+                range: None,
+            };
+            self.state.set_text_document(p.item.uri.clone(), &[event])?;
+            symbol
+        };
+
+        let Some(symbol) = symbol else {
+            return Ok(None);
+        };
+
+        let target_symbol_name = symbol.0.clone();
+        let Some(locations) = self.symbol_references(symbol).await? else {
+            return Ok(None);
+        };
+
+        return Ok(Some(
+            locations
+                .into_iter()
+                .unique_by(|l| l.uri.clone())
+                .filter_map(|l| {
+                    symbol_of(&l).ne(&target_symbol_name).then_some(1)?;
+                    Some(lsp::CallHierarchyIncomingCall {
+                        from: lsp::CallHierarchyItem {
+                            name: symbol_of(&l),
+                            kind: lsp::SymbolKind::VARIABLE,
+                            uri: l.uri,
+                            range: l.range,
+                            selection_range: l.range,
+                            tags: None,
+                            detail: None,
+                            data: None,
+                        },
+                        from_ranges: vec![l.range],
+                    })
+                })
+                .collect(),
+        ));
+    }
+
+    async fn call_hierarchy_outgoing_calls(
+        self,
+        p: lsp::CallHierarchyOutgoingCallsParams,
+    ) -> Req<R::CallHierarchyOutgoingCalls> {
+        let st = self.state.clone();
+        let uri_of = |symbol_name: &str, st: &Arc<ServerState>| -> Option<(lsp::Url, String)> {
+            let s = st.symbols.get(symbol_name)?;
+            let ext = &s.value().definition_file_ext.clone()?;
+            let path = st.cache_dir.join(symbol_name.to_owned() + ext);
+            let d = s.value().definition.clone()?;
+            let uri = lsp::Url::from_file_path(path).ok()?;
+            Some((uri, d))
+        };
+
+        let Some((uri, text)) = uri_of(&p.item.name, &st) else {
+            return Ok(None);
+        };
+
+        if self.state.get_text_document(uri.clone()).is_err() {
+            let event = lsp::TextDocumentContentChangeEvent {
+                text,
+                range_length: None,
+                range: None,
+            };
+            self.state.set_text_document(uri.clone(), &[event])?;
+        }
+
+        let symbols = self
+            .document_symbol(lsp::DocumentSymbolParams {
+                text_document: lsp::TextDocumentIdentifier::new(uri.clone()),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await?;
+
+        let symbols = match symbols {
+            Some(lsp::DocumentSymbolResponse::Nested(symbols)) => symbols,
+            None => return Ok(None),
+            _ => unreachable!(),
+        };
+
+        let items = symbols
+            .into_iter()
+            .unique_by(|s| s.name.clone())
+            .filter_map(|s| {
+                let symbol = st.get_symbol(&s.name)?;
+                let _ = st.emit_symbol_definition(symbol).ok()?;
+                Some(lsp::CallHierarchyOutgoingCall {
+                    to: lsp::CallHierarchyItem {
+                        name: s.name,
+                        kind: lsp::SymbolKind::VARIABLE,
+                        uri: uri.clone(),
+                        range: s.range,
+                        selection_range: s.selection_range,
+                        tags: None,
+                        detail: None,
+                        data: None,
+                    },
+                    from_ranges: vec![s.range],
+                })
+            })
+            .collect();
+
+        return Ok(Some(items));
+    }
+
     async fn semantic_tokens(self, p: lsp::TextDocumentIdentifier) -> Result<lsp::SemanticTokens> {
         let Some(hl_idx) = self.state.token_type_highlight_idx.get().cloned() else {
             debug!("token_type_highlight_idx not set");
@@ -527,17 +689,20 @@ impl Server {
             .collect::<Vec<_>>();
 
         symbols.sort_unstable_by_key(|s| s.range.start);
-
         Ok(Some(lsp::DocumentSymbolResponse::Nested(symbols)))
     }
 
     async fn references(self, p: lsp::ReferenceParams) -> Req<R::References> {
         let url = p.text_document_position.text_document.uri;
         let position = p.text_document_position.position;
-        let Some((symbol_to_search, _)) = self.get_symbol_on_text_document(url, position)? else {
-            return Ok(None);
-        };
+        match self.get_symbol_on_text_document(url, position)? {
+            Some(s) => self.symbol_references(s).await,
+            None => Ok(None),
+        }
+    }
 
+    async fn symbol_references(self, s: (String, SymbolInfo)) -> Req<R::References> {
+        let symbol_to_search = s.0;
         let case_sensitive = self.state.config.case_sensitive.unwrap_or(true);
         let symbol_to_search_len = symbol_to_search.len() as u32;
         let symbol_to_search_by_case_sensitive = &match case_sensitive {
@@ -611,8 +776,6 @@ impl Server {
         if self.state.compact_emit_process.get().is_none_or(|c| !c) {
             return Ok(Some(locations));
         }
-
-        use itertools::Itertools;
 
         let mut source_idx = 1;
         let mut buf = format!(
@@ -691,7 +854,8 @@ impl Server {
     }
 
     async fn ws_symbol_resolve(self, p: lsp::WorkspaceSymbol) -> Req<R::WorkspaceSymbolResolve> {
-        let symbol = self.get_symbol(&p.name).context("Expect symbol resolve")?;
+        let get_symbol = self.state.get_symbol(&p.name);
+        let symbol = get_symbol.context("Expect symbol resolve")?;
         let _ = self.state.emit_symbol_definition(symbol)?;
         Ok(p)
     }
@@ -760,7 +924,7 @@ impl Server {
         if !client_resolve_support && full_emit {
             symbols.par_iter().for_each(|(_, s)| {
                 if !std::fs::exists(self.state.cache_dir.join(&s.name)).is_ok_and(|e| e) {
-                    let symbol = self.get_symbol(&s.name).unwrap();
+                    let symbol = self.state.get_symbol(&s.name).unwrap();
                     let _ = self.state.emit_symbol_definition(symbol);
                 };
             });
@@ -812,7 +976,7 @@ impl Server {
         } else {
             let update = self.state.update_symbol(&symbol).await;
             let _ = update.inspect_err(|e| error!("update symbol error: {e}"));
-            self.get_symbol(&symbol).unwrap()
+            self.state.get_symbol(&symbol).unwrap()
         };
         let zero_range = lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0));
         let output_file_uri = self.state.emit_symbol_definition((symbol, symbol_info))?;
@@ -948,6 +1112,7 @@ impl Server {
                         }
                     }),
                 ),
+                call_hierarchy_provider: Some(lsp::CallHierarchyServerCapability::Simple(true)),
                 ..lsp::ServerCapabilities::default()
             },
             server_info: Some(lsp::ServerInfo {
@@ -996,13 +1161,23 @@ impl Server {
         let str = Server::semantic_tokens_range;
         add_request::<R::SemanticTokensFullRequest, _, _>(&mut router, stf);
         add_request::<R::SemanticTokensRangeRequest, _, _>(&mut router, str);
-        add_request::<R::DocumentSymbolRequest, _, _>(&mut router, Server::document_symbol);
+
+        let chp = Server::call_hierarchy_prepare;
+        let chic = Server::call_hierarchy_incoming_calls;
+        let cgoc = Server::call_hierarchy_outgoing_calls;
+        add_request::<R::CallHierarchyPrepare, _, _>(&mut router, chp);
+        add_request::<R::CallHierarchyIncomingCalls, _, _>(&mut router, chic);
+        add_request::<R::CallHierarchyOutgoingCalls, _, _>(&mut router, cgoc);
+
         add_request::<R::References, _, _>(&mut router, Server::references);
-        add_request::<R::WorkspaceSymbolResolve, _, _>(&mut router, Server::ws_symbol_resolve);
-        add_request::<R::WorkspaceSymbolRequest, _, _>(&mut router, Server::ws_symbol);
         add_request::<R::GotoDefinition, _, _>(&mut router, Server::definition);
         add_request::<R::Completion, _, _>(&mut router, Server::completion);
         add_request::<R::HoverRequest, _, _>(&mut router, Server::hover);
+
+        add_request::<R::DocumentSymbolRequest, _, _>(&mut router, Server::document_symbol);
+        add_request::<R::WorkspaceSymbolResolve, _, _>(&mut router, Server::ws_symbol_resolve);
+        add_request::<R::WorkspaceSymbolRequest, _, _>(&mut router, Server::ws_symbol);
+
         add_request::<R::Initialize, _, _>(&mut router, Server::initialize);
         add_request::<R::Shutdown, _, _>(&mut router, Server::shutdown);
 
