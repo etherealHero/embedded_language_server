@@ -128,6 +128,7 @@ struct ServerState {
     compact_output_buffer_idx: Arc<std::sync::atomic::AtomicU8>,
 }
 
+#[derive(Clone)]
 struct Server {
     state: Arc<ServerState>,
 }
@@ -420,12 +421,27 @@ impl Server {
         p: lsp::CallHierarchyPrepareParams,
     ) -> Req<R::CallHierarchyPrepare> {
         let st = self.state.clone();
-        let definition = self.definition(lsp::GotoDefinitionParams {
+        let uri = p.text_document_position_params.text_document.uri.clone();
+        let pos = p.text_document_position_params.position;
+        let maybe_req_from_ide_panel = pos == lsp::Position::new(0, 0);
+        let definition_params = lsp::GotoDefinitionParams {
             text_document_position_params: p.text_document_position_params,
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
-        });
-        let location = match definition.await? {
+        };
+        let definition = self.clone().definition(definition_params).await?;
+        let definition = if definition.is_none() && maybe_req_from_ide_panel {
+            let path = uri.to_file_path().unwrap();
+            let symbol_name = path.file_stem().unwrap().to_str().unwrap();
+            let Some(symbol) = st.get_symbol(symbol_name) else {
+                return Ok(None);
+            };
+            self.symbol_definition(symbol).await?
+        } else {
+            definition
+        };
+
+        let location = match definition {
             Some(lsp::GotoDefinitionResponse::Scalar(l)) => l,
             None => return Ok(None),
             _ => unreachable!(),
@@ -455,6 +471,7 @@ impl Server {
             path.file_stem().unwrap().to_str().unwrap().to_string()
         };
 
+        // TODO: refactor
         let symbol = 'open_symbol: {
             let pos = lsp::Position::new(0, 0);
             let zero_range = lsp::Range::new(pos, pos);
@@ -1006,9 +1023,14 @@ impl Server {
     async fn definition(self, p: lsp::GotoDefinitionParams) -> Req<R::GotoDefinition> {
         let url = p.text_document_position_params.text_document.uri;
         let position = p.text_document_position_params.position;
-        let Some((symbol, symbol_info)) = self.get_symbol_on_text_document(url, position)? else {
-            return Ok(None);
-        };
+        match self.get_symbol_on_text_document(url, position)? {
+            Some(s) => self.symbol_definition(s).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn symbol_definition(self, s: (String, SymbolInfo)) -> Req<R::GotoDefinition> {
+        let (symbol, symbol_info) = s;
         if symbol_info.definition.is_none() | symbol_info.definition_file_ext.is_none() {
             warn!("definition info of `{symbol}` symbol not set");
             return Ok(None);
